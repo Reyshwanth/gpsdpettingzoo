@@ -48,6 +48,66 @@ class Agent(nn.Module):
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
 
+class CNNAgent(nn.Module):
+    """CNN + MLP policy/value network (must match train_gpsd_cnn.py)."""
+
+    POI_VEC_START = 5
+    POI_CHANNELS  = 3
+    CNN_FEAT_DIM  = 128
+
+    def __init__(self, num_agents: int, n_cells: int, act_dim: int):
+        super().__init__()
+        self.num_agents = num_agents
+        self.n_cells = n_cells
+        self.poi_end = self.POI_VEC_START + n_cells * n_cells * self.POI_CHANNELS
+        self.vec_dim = self.POI_VEC_START + (num_agents - 1) * 4
+
+        self.cnn = nn.Sequential(
+            layer_init(nn.Conv2d(self.POI_CHANNELS, 16, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(16, 32, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((2, 2)),
+            nn.Flatten(),
+        )
+
+        combined_dim = self.CNN_FEAT_DIM + self.vec_dim
+        self.network = nn.Sequential(
+            layer_init(nn.Linear(combined_dim, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+        )
+        self.actor = layer_init(nn.Linear(256, act_dim), std=0.01)
+        self.critic = layer_init(nn.Linear(256, 1), std=1)
+
+    def _split_obs(self, x):
+        vec_part1 = x[:, :self.POI_VEC_START]
+        poi_flat  = x[:, self.POI_VEC_START:self.poi_end]
+        vec_part2 = x[:, self.poi_end:]
+        vec = torch.cat([vec_part1, vec_part2], dim=1)
+        poi_img = poi_flat.reshape(-1, self.n_cells, self.n_cells, self.POI_CHANNELS)
+        poi_img = poi_img.permute(0, 3, 1, 2)
+        return vec, poi_img
+
+    def _encode(self, x):
+        vec, poi_img = self._split_obs(x)
+        cnn_features = self.cnn(poi_img)
+        combined = torch.cat([vec, cnn_features], dim=1)
+        return self.network(combined)
+
+    def get_value(self, x):
+        return self.critic(self._encode(x))
+
+    def get_action_and_value(self, x, action=None):
+        hidden = self._encode(x)
+        logits = self.actor(hidden)
+        probs = Categorical(logits=logits)
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+
+
 # ---------------------------------------------------------------------------
 # Policy selection
 # ---------------------------------------------------------------------------
@@ -65,19 +125,40 @@ def list_available_policies():
     return policies
 
 
-def load_policy(model_path, obs_dim, act_dim, device):
-    """Load a trained policy from disk."""
-    agent = Agent(obs_dim, act_dim).to(device)
+def load_checkpoint_args(model_path):
+    """Load the training args saved in a checkpoint (if available)."""
+    checkpoint = torch.load(model_path, map_location="cpu")
+    if isinstance(checkpoint, dict) and 'args' in checkpoint:
+        return checkpoint['args']
+    return {}
+
+
+def load_policy(model_path, obs_dim, act_dim, device, num_agents=5, n_cells=4):
+    """Load a trained policy from disk (auto-detects MLP vs CNN architecture)."""
     checkpoint = torch.load(model_path, map_location=device)
-    
-    # Handle both checkpoint format and raw state dict format
+
+    # Detect architecture from checkpoint metadata
+    arch = None
+    ckpt_n_cells = n_cells
+    ckpt_num_agents = num_agents
+    if isinstance(checkpoint, dict):
+        arch = checkpoint.get('arch', None)
+        ckpt_n_cells = checkpoint.get('n_cells', n_cells)
+        ckpt_args = checkpoint.get('args', {})
+        ckpt_num_agents = ckpt_args.get('num_agents', num_agents)
+
+    if arch == 'cnn':
+        agent = CNNAgent(ckpt_num_agents, ckpt_n_cells, act_dim).to(device)
+        print(f"  Architecture: CNN (n_cells={ckpt_n_cells})")
+    else:
+        agent = Agent(obs_dim, act_dim).to(device)
+        print(f"  Architecture: MLP")
+
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        # Checkpoint format (includes optimizer state, args, etc.)
         agent.load_state_dict(checkpoint['model_state_dict'])
     else:
-        # Raw state dict format
         agent.load_state_dict(checkpoint)
-    
+
     agent.eval()
     return agent
 
@@ -93,6 +174,10 @@ def parse_args():
                         help="Number of episodes to run")
     parser.add_argument("--max-cycles", type=int, default=100,
                         help="Maximum cycles per episode")
+    parser.add_argument("--cell-width", type=float, default=None,
+                        help="Cell width override (auto-detected from checkpoint if not set)")
+    parser.add_argument("--num-agents", type=int, default=None,
+                        help="Number of agents override (auto-detected from checkpoint if not set)")
     parser.add_argument("--no-render", action="store_true",
                         help="Disable rendering (faster)")
     return parser.parse_args()
@@ -127,12 +212,45 @@ if __name__ == "__main__":
         print("GPSD ENVIRONMENT - RANDOM POLICY VISUALIZATION")
     print("=" * 70)
 
+    # --- Auto-detect env params from checkpoint ---
+    ckpt_args = {}
+    policy_path = None
+    if use_trained_policy:
+        policy_path = args.policy
+        if os.path.isdir(policy_path):
+            policy_path = os.path.join(policy_path, "gpsd_ppo_agent.pt")
+            print(f"Directory provided, using: {policy_path}")
+        if not os.path.exists(policy_path):
+            print(f"\n✗ Error: Policy file not found: {policy_path}")
+            print("Run with --policy list to see available policies")
+            sys.exit(1)
+        ckpt_args = load_checkpoint_args(policy_path)
+        if ckpt_args:
+            print(f"  Loaded training config from checkpoint")
+
+    # Resolve env parameters: CLI override > checkpoint > defaults
+    N_a = args.num_agents or ckpt_args.get('num_agents', 5)
+    cell_width = args.cell_width or ckpt_args.get('cell_width', 0.25)
+    speed = ckpt_args.get('speed', 0.2)
+    r_c = ckpt_args.get('r_c', 0.3)
+    cov_c = ckpt_args.get('cov_c', 0.25)
+    max_cycles = args.max_cycles
+
+    # Show computed grid info
+    zone_size = 1.0
+    n_cells = int(np.round(zone_size / cell_width))
+    n_pois = n_cells * n_cells
+    print(f"  cell_width={cell_width}, grid={n_cells}x{n_cells}, POIs={n_pois}, N_a={N_a}")
+
     # Create the environment with rendering enabled
     render_mode = None if args.no_render else "human"
     e = raw_env(
-        N_a=5,
-        cell_width=0.25,  # GPS denied zone (1.0 wide) / 0.25 = 4x4 = 16 POIs
-        max_cycles=args.max_cycles,
+        N_a=N_a,
+        cell_width=cell_width,
+        max_cycles=max_cycles,
+        speed=speed,
+        r_c=r_c,
+        cov_c=cov_c,
         render_mode=render_mode
     )
 
@@ -145,24 +263,13 @@ if __name__ == "__main__":
     policy_agent = None
     device = torch.device("cpu")
     if use_trained_policy:
-        # Auto-complete path if directory is provided
-        policy_path = args.policy
-        if os.path.isdir(policy_path):
-            # User provided directory, append the model filename
-            policy_path = os.path.join(policy_path, "gpsd_ppo_agent.pt")
-            print(f"Directory provided, using: {policy_path}")
-        
-        if not os.path.exists(policy_path):
-            print(f"\n✗ Error: Policy file not found: {policy_path}")
-            print("Run with --policy list to see available policies")
-            sys.exit(1)
-        
         obs_dim = e.observation_space(e.possible_agents[0]).shape[0]
         act_dim = e.action_space(e.possible_agents[0]).n
         print(f"\nLoading trained policy from: {policy_path}")
         print(f"  Observation dim: {obs_dim}")
         print(f"  Action dim: {act_dim}")
-        policy_agent = load_policy(policy_path, obs_dim, act_dim, device)
+        policy_agent = load_policy(policy_path, obs_dim, act_dim, device,
+                                    num_agents=N_a, n_cells=n_cells)
         print("✓ Policy loaded successfully!")
 
     # Run episodes

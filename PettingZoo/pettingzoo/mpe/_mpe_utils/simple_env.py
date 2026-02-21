@@ -201,6 +201,14 @@ class SimpleEnv(AECEnv):
                 reward = agent_reward
 
             self.rewards[agent.name] = reward
+        
+        # Add coverage ratio info for tracking
+        if hasattr(self.scenario, 'covered') and hasattr(self.world, 'landmarks'):
+            total_pois = len(self.world.landmarks)
+            num_covered = sum(self.scenario.covered) if total_pois > 0 else 0
+            coverage_ratio = num_covered / total_pois if total_pois > 0 else 0.0
+            for agent in self.world.agents:
+                self.infos[agent.name]['coverage_ratio'] = coverage_ratio
 
     # set env action for a particular agent
     def _set_action(self, action, agent, action_space, time=None):

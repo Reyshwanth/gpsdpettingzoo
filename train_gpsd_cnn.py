@@ -1,24 +1,28 @@
-"""CleanRL PPO training script for the GPSD (GPS-Denied Coverage) environment.
+"""CleanRL PPO training script for GPSD with a CNN+MLP hybrid agent.
 
-Adapted from the CleanRL PPO implementation for PettingZoo multi-agent environments.
-Reference: https://pettingzoo.farama.org/tutorials/cleanrl/advanced_PPO/
+This variant embeds the POI relative-positions and coverage status into a
+spatial image (n_cells × n_cells × 3) that is processed by a small CNN before
+being concatenated with the remaining vector observation and fed into an MLP.
+The CNN uses AdaptiveAvgPool2d so the architecture is agnostic to grid
+resolution — changing cell_width (and therefore the number of POIs) does NOT
+require any architecture changes.
 
-The GPSD environment is a cooperative multi-agent coverage problem where agents
-navigate into a GPS-denied zone to cover points of interest while managing
-position uncertainty (EKF covariance). All agents share a parameter-shared
-policy trained with PPO.
+Observation layout produced by gpsd.py:
+    heading            (1)
+    belief_pos         (2)
+    cov_trace          (1)
+    in_gpsd_zone       (1)
+    --- POI block ---  (n_cells*n_cells * 3)   ← rel_x, rel_y, covered
+    other_agent_rel    ((N_a-1) * 2)
+    other_agent_comm   ((N_a-1) * 2)
 
-Key differences from the Atari CleanRL tutorial:
-  - Vector observations (1D) instead of images → MLP network, not CNN
-  - 5 agents by default (not 2) → num_envs must be a multiple of num_agents
-  - No Atari-specific preprocessing (frame stacking, colour reduction, etc.)
+The Agent splits this flat vector, reshapes the POI block into
+(3, n_cells, n_cells), runs it through the CNN, and fuses with the rest.
 
 Usage:
-    python train_gpsd_ppo.py                        # defaults
-    python train_gpsd_ppo.py --total-timesteps 500000 --num-envs 20
-    python train_gpsd_ppo.py --track --wandb-project-name gpsd  # W&B logging
-
-Authors: Adapted from Costa (https://github.com/vwxyzjn) and Elliot (https://github.com/elliottower)
+    python train_gpsd_cnn.py                        # defaults
+    python train_gpsd_cnn.py --total-timesteps 500000 --num-envs 20
+    python train_gpsd_cnn.py --track --wandb-project-name gpsd-cnn
 """
 
 # flake8: noqa
@@ -38,16 +42,15 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-# ---------------------------------------------------------------------------
-# The local PettingZoo (with GPSD) should be installed in editable mode:
-#   pip install -e PettingZoo/
-# ---------------------------------------------------------------------------
 from pettingzoo.mpe.gpsd.gpsd import parallel_env as make_gpsd_parallel_env
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 def parse_args():
     # fmt: off
-    parser = argparse.ArgumentParser(description="CleanRL PPO for GPSD environment")
+    parser = argparse.ArgumentParser(description="CleanRL PPO (CNN) for GPSD environment")
 
     # --- General ---
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
@@ -140,15 +143,46 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 # ---------------------------------------------------------------------------
-# Agent (parameter-shared across all GPSD agents)
+# CNN + MLP Agent (parameter-shared across all GPSD agents)
 # ---------------------------------------------------------------------------
 class Agent(nn.Module):
-    """MLP policy + value network for vector observations."""
+    """CNN + MLP policy/value network.
 
-    def __init__(self, obs_dim: int, act_dim: int):
+    The flat observation is split into:
+      - vector part: heading(1) + belief_pos(2) + cov_trace(1) + in_gpsd_zone(1)
+                     + other_agent_rel_pos((N_a-1)*2) + other_agent_comm((N_a-1)*2)
+      - POI image:   (3, n_cells, n_cells) with channels [rel_x, rel_y, covered]
+
+    The POI image is run through a small CNN with AdaptiveAvgPool2d so that any
+    grid resolution (i.e. any cell_width / number of POIs) maps to a fixed-size
+    feature vector.  This is concatenated with the vector part and fed to an MLP.
+    """
+
+    POI_VEC_START = 5          # index where POI data begins in flat obs
+    POI_CHANNELS  = 3          # rel_x, rel_y, covered per POI
+    CNN_FEAT_DIM  = 128        # fixed output size after adaptive pool (32*2*2)
+
+    def __init__(self, num_agents: int, n_cells: int, act_dim: int):
         super().__init__()
+        self.num_agents = num_agents
+        self.n_cells = n_cells
+        self.poi_end = self.POI_VEC_START + n_cells * n_cells * self.POI_CHANNELS
+        self.vec_dim = self.POI_VEC_START + (num_agents - 1) * 4  # non-POI vector length
+
+        # --- CNN branch for the POI spatial image ---
+        self.cnn = nn.Sequential(
+            layer_init(nn.Conv2d(self.POI_CHANNELS, 16, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(16, 32, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((2, 2)),      # → (batch, 32, 2, 2)
+            nn.Flatten(),                       # → (batch, 128)
+        )
+
+        # --- MLP trunk (takes CNN features + vector obs) ---
+        combined_dim = self.CNN_FEAT_DIM + self.vec_dim
         self.network = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
+            layer_init(nn.Linear(combined_dim, 256)),
             nn.Tanh(),
             layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
@@ -156,11 +190,29 @@ class Agent(nn.Module):
         self.actor = layer_init(nn.Linear(256, act_dim), std=0.01)
         self.critic = layer_init(nn.Linear(256, 1), std=1)
 
+    # ------------------------------------------------------------------ #
+    def _split_obs(self, x):
+        """Split a flat observation into (vector, poi_image) tensors."""
+        vec_part1 = x[:, :self.POI_VEC_START]              # heading, belief, cov, gpsd flag
+        poi_flat  = x[:, self.POI_VEC_START:self.poi_end]   # POI data
+        vec_part2 = x[:, self.poi_end:]                     # other-agent data
+        vec = torch.cat([vec_part1, vec_part2], dim=1)
+        # Reshape to (batch, n_cells, n_cells, 3) then to (batch, 3, n_cells, n_cells)
+        poi_img = poi_flat.reshape(-1, self.n_cells, self.n_cells, self.POI_CHANNELS)
+        poi_img = poi_img.permute(0, 3, 1, 2)
+        return vec, poi_img
+
+    def _encode(self, x):
+        vec, poi_img = self._split_obs(x)
+        cnn_features = self.cnn(poi_img)
+        combined = torch.cat([vec, cnn_features], dim=1)
+        return self.network(combined)
+
     def get_value(self, x):
-        return self.critic(self.network(x))
+        return self.critic(self._encode(x))
 
     def get_action_and_value(self, x, action=None):
-        hidden = self.network(x)
+        hidden = self._encode(x)
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
@@ -174,10 +226,7 @@ class Agent(nn.Module):
 def make_env(args):
     """Create a vectorised GPSD environment compatible with CleanRL's PPO loop.
 
-    Pipeline:
-        parallel_env  →  pettingzoo_env_to_vec_env  →  concat_vec_envs
-    Each parallel env contributes `num_agents` slots to the vector env, so we
-    create  num_envs // num_agents  independent copies.
+    Returns (envs, n_cells) where n_cells is the POI grid resolution.
     """
     env = make_gpsd_parallel_env(
         N_a=args.num_agents,
@@ -187,6 +236,8 @@ def make_env(args):
         r_c=args.r_c,
         cov_c=args.cov_c,
     )
+    # Grab n_cells from the underlying world before wrapping
+    n_cells = env.unwrapped.world.n_cells
     env = ss.pettingzoo_env_to_vec_env_v1(env)
     num_copies = args.num_envs // args.num_agents
     envs = ss.concat_vec_envs_v1(
@@ -195,7 +246,7 @@ def make_env(args):
     envs.single_observation_space = envs.observation_space
     envs.single_action_space = envs.action_space
     envs.is_vector_env = True
-    return envs
+    return envs, n_cells
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +313,7 @@ if __name__ == "__main__":
     args = parse_args()
     run_name = f"gpsd__{args.exp_name}__{args.seed}__{int(time.time())}"
     print(f"\n{'='*70}")
-    print(f"  GPSD PPO Training  —  {run_name}")
+    print(f"  GPSD PPO-CNN Training  —  {run_name}")
     print(f"{'='*70}")
     print(args)
     print()
@@ -300,11 +351,12 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Environment setup
     # ------------------------------------------------------------------
-    envs = make_env(args)
+    envs, n_cells = make_env(args)
     obs_dim = np.array(envs.single_observation_space.shape).prod()
     act_dim = envs.single_action_space.n
     print(f"Observation dim : {obs_dim}")
     print(f"Action dim      : {act_dim}")
+    print(f"POI grid        : {n_cells}x{n_cells} = {n_cells*n_cells} POIs")
     print(f"Num vec envs    : {args.num_envs}  "
           f"({args.num_envs // args.num_agents} games × {args.num_agents} agents)")
     print(f"Batch size      : {args.batch_size}")
@@ -318,7 +370,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Agent & optimiser
     # ------------------------------------------------------------------
-    agent = Agent(obs_dim, act_dim).to(device)
+    agent = Agent(args.num_agents, n_cells, act_dim).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     print(f"Agent parameters: {sum(p.numel() for p in agent.parameters()):,}")
 
@@ -348,11 +400,11 @@ if __name__ == "__main__":
     next_truncation = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
     print(f"Number of PPO updates: {num_updates}\n")
-    
-    # Episode tracking buffers for computing mean statistics
-    episode_returns_buffer = []  # Track returns for mean episode reward
-    episode_lengths_buffer = []  # Track episode lengths
-    individual_returns_buffer = {i: [] for i in range(args.num_agents)}  # Per-agent returns
+
+    # Episode tracking buffers
+    episode_returns_buffer = []
+    episode_lengths_buffer = []
+    individual_returns_buffer = {i: [] for i in range(args.num_agents)}
 
     for update in range(1, num_updates + 1):
         # --- Learning rate annealing ---
@@ -364,21 +416,19 @@ if __name__ == "__main__":
         # ===============================================================
         # Rollout phase – collect experience
         # ===============================================================
-        coverage_ratios = []  # Track coverage ratios during rollout
+        coverage_ratios = []
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             terminations[step] = next_termination
             truncations[step] = next_truncation
 
-            # Action selection
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
-            # Environment step
             next_obs, reward, termination, truncation, info = envs.step(
                 action.cpu().numpy()
             )
@@ -397,36 +447,29 @@ if __name__ == "__main__":
                     coverage_ratios.append(np.mean(step_coverage_ratios))
 
             # --- Log episodic returns ---
-            # SuperSuit's vectorised envs return info as a list of dicts.
-            # When an episode ends the wrapper inserts an "episode" key.
             if isinstance(info, (list, tuple)):
-                # Track episodes that completed in this step
                 completed_episodes_this_step = []
-                
+
                 for idx, item in enumerate(info):
                     if isinstance(item, dict) and "episode" in item:
                         agent_idx = idx % args.num_agents
                         ep_return = item["episode"]["r"]
                         ep_length = item["episode"]["l"]
-                        
-                        # Log individual agent metrics
+
                         writer.add_scalar(
                             f"charts/episodic_return_agent{agent_idx}",
-                            ep_return,
-                            global_step,
+                            ep_return, global_step,
                         )
                         writer.add_scalar(
                             f"charts/episodic_length_agent{agent_idx}",
-                            ep_length,
-                            global_step,
+                            ep_length, global_step,
                         )
-                        
-                        # Store for aggregation
+
                         episode_returns_buffer.append(ep_return)
                         episode_lengths_buffer.append(ep_length)
                         individual_returns_buffer[agent_idx].append(ep_return)
                         completed_episodes_this_step.append((agent_idx, ep_return, ep_length))
-                        
+
                         if agent_idx == 0:
                             print(
                                 f"  update={update}/{num_updates}  "
@@ -434,46 +477,28 @@ if __name__ == "__main__":
                                 f"agent_{agent_idx}_return={ep_return:.2f}  "
                                 f"length={ep_length}"
                             )
-                
-                # Log team-level statistics when we have complete episode data
+
                 if completed_episodes_this_step:
-                    # Mean episode reward across all agents in this step
                     step_returns = [r for _, r, _ in completed_episodes_this_step]
                     step_lengths = [l for _, _, l in completed_episodes_this_step]
-                    
-                    writer.add_scalar(
-                        "charts/mean_episode_reward",
-                        np.mean(step_returns),
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        "charts/mean_episode_length",
-                        np.mean(step_lengths),
-                        global_step,
-                    )
+
+                    writer.add_scalar("charts/mean_episode_reward",
+                                      np.mean(step_returns), global_step)
+                    writer.add_scalar("charts/mean_episode_length",
+                                      np.mean(step_lengths), global_step)
                     if args.track:
-                        wandb.log(
-                            {
-                                "avg_reward/step_mean": np.mean(step_returns),
-                                "avg_reward/step_min": np.min(step_returns),
-                                "avg_reward/step_max": np.max(step_returns),
-                            },
-                            step=global_step,
-                        )
-                    
-                    # Also log rolling averages immediately
+                        wandb.log({
+                            "avg_reward/step_mean": np.mean(step_returns),
+                            "avg_reward/step_min": np.min(step_returns),
+                            "avg_reward/step_max": np.max(step_returns),
+                        }, step=global_step)
+
                     if len(episode_returns_buffer) >= 10:
-                        writer.add_scalar(
-                            "marl/rolling_mean_return_10",
-                            np.mean(episode_returns_buffer[-10:]),
-                            global_step,
-                        )
+                        writer.add_scalar("marl/rolling_mean_return_10",
+                                          np.mean(episode_returns_buffer[-10:]), global_step)
                     if len(episode_lengths_buffer) >= 10:
-                        writer.add_scalar(
-                            "marl/rolling_mean_length_10",
-                            np.mean(episode_lengths_buffer[-10:]),
-                            global_step,
-                        )
+                        writer.add_scalar("marl/rolling_mean_length_10",
+                                          np.mean(episode_lengths_buffer[-10:]), global_step)
 
         # ===============================================================
         # Advantage estimation (GAE)
@@ -525,7 +550,6 @@ if __name__ == "__main__":
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # Approx KL: http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [
@@ -551,8 +575,7 @@ if __name__ == "__main__":
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                     v_clipped = b_values[mb_inds] + torch.clamp(
                         newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
+                        -args.clip_coef, args.clip_coef,
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
@@ -587,78 +610,45 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        
-        # Log average coverage ratio during rollout
+
         if coverage_ratios:
-            avg_coverage_ratio = np.mean(coverage_ratios)
-            writer.add_scalar("charts/avg_coverage_ratio", avg_coverage_ratio, global_step)
-        
+            writer.add_scalar("charts/avg_coverage_ratio",
+                              np.mean(coverage_ratios), global_step)
+
         # ===============================================================
         # Aggregate Episode Statistics (MARL Metrics)
         # ===============================================================
-        # Compute rolling statistics over recent episodes
-        if len(episode_returns_buffer) >= 10:  # Require at least 10 episodes
-            # Overall mean episode reward across all agents
+        if len(episode_returns_buffer) >= 10:
             window_size = min(100, len(episode_returns_buffer))
             rolling_mean = np.mean(episode_returns_buffer[-window_size:])
             rolling_std = np.std(episode_returns_buffer[-window_size:])
             rolling_min = np.min(episode_returns_buffer[-window_size:])
             rolling_max = np.max(episode_returns_buffer[-window_size:])
-            writer.add_scalar(
-                "marl/mean_episode_reward_all",
-                rolling_mean,
-                global_step,
-            )
-            writer.add_scalar(
-                "marl/std_episode_reward_all",
-                rolling_std,
-                global_step,
-            )
-            writer.add_scalar(
-                "marl/min_episode_reward",
-                rolling_min,
-                global_step,
-            )
-            writer.add_scalar(
-                "marl/max_episode_reward",
-                rolling_max,
-                global_step,
-            )
-            # Total episodes completed so far
-            writer.add_scalar(
-                "marl/total_episodes_completed",
-                len(episode_returns_buffer),
-                global_step,
-            )
+            writer.add_scalar("marl/mean_episode_reward_all", rolling_mean, global_step)
+            writer.add_scalar("marl/std_episode_reward_all", rolling_std, global_step)
+            writer.add_scalar("marl/min_episode_reward", rolling_min, global_step)
+            writer.add_scalar("marl/max_episode_reward", rolling_max, global_step)
+            writer.add_scalar("marl/total_episodes_completed",
+                              len(episode_returns_buffer), global_step)
             if args.track:
-                wandb.log(
-                    {
-                        "avg_reward/rolling_mean_100": rolling_mean,
-                        "avg_reward/rolling_std_100": rolling_std,
-                        "avg_reward/rolling_min_100": rolling_min,
-                        "avg_reward/rolling_max_100": rolling_max,
-                        "avg_reward/total_episodes": len(episode_returns_buffer),
-                    },
-                    step=global_step,
-                )
-        
+                wandb.log({
+                    "avg_reward/rolling_mean_100": rolling_mean,
+                    "avg_reward/rolling_std_100": rolling_std,
+                    "avg_reward/rolling_min_100": rolling_min,
+                    "avg_reward/rolling_max_100": rolling_max,
+                    "avg_reward/total_episodes": len(episode_returns_buffer),
+                }, step=global_step)
+
         if len(episode_lengths_buffer) >= 10:
-            # Episode length statistics
             window_size = min(100, len(episode_lengths_buffer))
-            writer.add_scalar(
-                "marl/mean_episode_length",
-                np.mean(episode_lengths_buffer[-window_size:]),
-                global_step,
-            )
-            writer.add_scalar(
-                "marl/std_episode_length",
-                np.std(episode_lengths_buffer[-window_size:]),
-                global_step,
-            )
-        
-        # Individual agent performance vs team average
-        # Check if we have at least 5 episodes per agent
-        min_episodes_per_agent = min(len(individual_returns_buffer[i]) for i in range(args.num_agents))
+            writer.add_scalar("marl/mean_episode_length",
+                              np.mean(episode_lengths_buffer[-window_size:]), global_step)
+            writer.add_scalar("marl/std_episode_length",
+                              np.std(episode_lengths_buffer[-window_size:]), global_step)
+
+        min_episodes_per_agent = min(
+            len(individual_returns_buffer[i]) for i in range(args.num_agents)
+        )
         if min_episodes_per_agent >= 5:
             individual_means = []
             for agent_id in range(args.num_agents):
@@ -668,41 +658,34 @@ if __name__ == "__main__":
                     individual_means.append(agent_mean)
                     writer.add_scalar(
                         f"marl/individual_mean_return_agent{agent_id}",
-                        agent_mean,
-                        global_step,
+                        agent_mean, global_step,
                     )
-            
-            if individual_means:
-                team_mean_return = np.mean(individual_means)
-                writer.add_scalar(
-                    "marl/team_mean_return",
-                    team_mean_return,
-                    global_step,
-                )
-                # Return variance across agents (measure of fairness/balance)
-                writer.add_scalar(
-                    "marl/return_variance_across_agents",
-                    np.var(individual_means),
-                    global_step,
-                )
 
-        # Log per-update mean reward across the entire rollout batch
+            if individual_means:
+                writer.add_scalar("marl/team_mean_return",
+                                  np.mean(individual_means), global_step)
+                writer.add_scalar("marl/return_variance_across_agents",
+                                  np.var(individual_means), global_step)
+
         batch_mean_reward = rewards.mean().item()
         writer.add_scalar("charts/batch_mean_reward", batch_mean_reward, global_step)
         if args.track:
-            wandb.log(
-                {"avg_reward/batch_mean_reward": batch_mean_reward},
-                step=global_step,
-            )
+            wandb.log({"avg_reward/batch_mean_reward": batch_mean_reward},
+                      step=global_step)
 
         sps = int(global_step / (time.time() - start_time))
         writer.add_scalar("charts/SPS", sps, global_step)
 
         if update % 10 == 0 or update == num_updates:
-            # Calculate recent episode stats for console output
-            recent_mean_return = np.mean(episode_returns_buffer[-20:]) if len(episode_returns_buffer) >= 5 else None
-            recent_mean_length = np.mean(episode_lengths_buffer[-20:]) if len(episode_lengths_buffer) >= 5 else None
-            
+            recent_mean_return = (
+                np.mean(episode_returns_buffer[-20:])
+                if len(episode_returns_buffer) >= 5 else None
+            )
+            recent_mean_length = (
+                np.mean(episode_lengths_buffer[-20:])
+                if len(episode_lengths_buffer) >= 5 else None
+            )
+
             stats_str = (
                 f"  [Update {update:>4}/{num_updates}]  "
                 f"step={global_step:>8}  "
@@ -713,12 +696,12 @@ if __name__ == "__main__":
                 f"explained_var={explained_var:.3f}  "
                 f"episodes={len(episode_returns_buffer)}"
             )
-            
+
             if recent_mean_return is not None:
                 stats_str += f"  mean_ret={recent_mean_return:.2f}"
             if recent_mean_length is not None:
                 stats_str += f"  mean_len={recent_mean_length:.1f}"
-            
+
             print(stats_str)
 
     # ==================================================================
@@ -738,6 +721,8 @@ if __name__ == "__main__":
             "model_state_dict": agent.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "args": vars(args),
+            "n_cells": n_cells,
+            "arch": "cnn",
             "global_step": global_step,
         }, model_path)
         print(f"  Model saved → {model_path}")

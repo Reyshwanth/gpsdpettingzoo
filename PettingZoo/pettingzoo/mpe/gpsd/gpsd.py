@@ -13,7 +13,7 @@ This environment is part of the <a href='..'>MPE environments</a>.
 | Agents               | 5                                                     |
 | Action Shape         | (5)                                                   |
 | Action Values        | Discrete(5)                                           |
-| Observation Shape    | (30,)                                                 |
+| Observation Shape    | (5 + N_r*3 + (N_a-1)*4,)                              |
 | Observation Values   | (-inf,inf)                                            |
 
 
@@ -95,7 +95,7 @@ class raw_env(SimpleEnv, EzPickle):
         max_w=1.0,
         speed=0.2,
         r_c=0.5,
-        cov_c=0.15,
+        cov_c=0.25,
         p_noise=0.1,
         r_cov=0.01,
     ):
@@ -303,6 +303,7 @@ class Scenario(BaseScenario):
         zone_min, zone_max = -0.5, 0.5
         zone_size = zone_max - zone_min
         n_cells = int(np.round(zone_size / cell_width))
+        world.n_cells = n_cells  # store before use below
         # Recompute actual cell width to fit evenly
         actual_cw = zone_size / n_cells
         # Cell centers: offset by half a cell from zone_min
@@ -335,6 +336,7 @@ class Scenario(BaseScenario):
         # POI appearance (green = uncovered)
         for lm in world.landmarks:
             lm.color = np.array([0.25, 0.75, 0.25])
+            lm.covered = False  # Initialize covered state
 
         # Place agents as a swarm outside the GPS denied zone
         # GPSD zone center is at (0, 0)
@@ -342,18 +344,23 @@ class Scenario(BaseScenario):
         
         # Pick a random swarm center location outside GPS denied zone
         swarm_center = None
+        radius=0.75
         while swarm_center is None:
-            pos = np_random.uniform(-1, +1, world.dim_p)
+            angle=np.random.uniform(0, 2*np.pi)
+            angle=0
+            pos = [radius*np.sin(angle-np.pi/2),radius*np.cos(angle-np.pi/2)]
             if not world.is_in_gpsd_zone(pos):
-                swarm_center = pos
-                break
+                swarm_center = np.array(pos)
         
         # Place all agents within 0.3 of the swarm center
-        for agent in world.agents:
+        spacing=0.1
+        for i,agent in enumerate(world.agents):
+            limits=len(world.agents)*spacing/2
+            centered_array = np.arange(-limits, limits + 1e-9, spacing)
             # Generate random offset within 0.3 radius
-            angle = np_random.uniform(0, 2 * np.pi)
-            radius = np_random.uniform(0, 0.3)
-            offset = np.array([radius * np.cos(angle), radius * np.sin(angle)])
+            radius=centered_array[i]
+            angle_perp=angle 
+            offset = np.array([radius*np.sin(angle_perp), radius*np.cos(angle_perp)])
             
             agent.state.p_pos = swarm_center + offset
             # Belief starts at true position (GPS available outside zone)
@@ -361,10 +368,8 @@ class Scenario(BaseScenario):
             # Constant speed stored as scalar so the unicycle formula works
             agent.state.p_vel = np.array([agent.speed, agent.speed])
             
-            # All agents point directly towards the center (0, 0)
-            direction_to_center = np.arctan2(gpsd_center[1] - agent.state.p_pos[1], 
-                                            gpsd_center[0] - agent.state.p_pos[0])
-            agent.state.heading = direction_to_center
+            
+            agent.state.heading = angle
             
             agent.state.p_covariance = np.zeros((world.dim_p, world.dim_p))
 
@@ -391,7 +396,7 @@ class Scenario(BaseScenario):
         rew = 0.0
 
         # Path penalty (each timestep costs a small amount)
-        rew -= 0.1
+        rew -= 0.05
 
         
         # Add reward proportional to number of agents in communication range
@@ -400,19 +405,19 @@ class Scenario(BaseScenario):
             if other is agent:
                 continue
             dist = np.sqrt(np.sum(np.square(agent.state.p_pos - other.state.p_pos)))
-            if dist <= self.r_c and self._get_cov_trace(other, world) < self.cov_c:
-                rew+=1.0/(1.0 + self._get_cov_trace(other, world))
+            #if dist <= self.r_c and self._get_cov_trace(other, world) < self.cov_c and (world.is_in_gpsd_zone(other.state.p_pos) or world.is_in_gpsd_zone(agent.state.p_pos)):
+            #    rew+=1.0/(1.0 + self._get_cov_trace(other, world))
 
 
         # Penalty for being in GPS denied zone with high covariance
         if world.is_in_gpsd_zone(agent.state.p_pos):
             cov_trace = self._get_cov_trace(agent, world)
-            if cov_trace > self.cov_c:
-                rew -= float(np.exp(cov_trace - self.cov_c))
+            if cov_trace < self.cov_c:
+                rew += float(np.exp(self.cov_c-cov_trace))
         else:
             gpsd_center = np.zeros(world.dim_p)
             dist_to_center = np.linalg.norm(agent.state.p_pos - gpsd_center)
-            rew -= 1.0 * np.exp(dist_to_center- 0.5)
+            rew -= -2.0 * np.exp(dist_to_center)
             # Penalize moving away from GPS denied zone center
             
 
@@ -428,6 +433,10 @@ class Scenario(BaseScenario):
     def global_reward(self, world):
         """Global cooperative reward: coverage progress for the whole team."""
         rew = 0.0
+        
+        # Calculate current coverage percentage for reward scaling
+        total_pois = len(world.landmarks)
+        num_covered = sum(self.covered)
 
         for i, lm in enumerate(world.landmarks):
             if self.covered[i]:
@@ -445,18 +454,31 @@ class Scenario(BaseScenario):
 
             # Check coverage condition
             if best_dist < self.r_c and best_cov_trace < self.cov_c:
-                # POI covered! Reward inversely proportional to covariance
+                # POI covered! Reward scales with percentage already covered
+                # Base reward inversely proportional to covariance
+                base_reward = 1.0 / (1.0 + best_cov_trace)
+                
+                # Scale factor: increases as more POIs are covered (1.0 to 3.0)
+                coverage_ratio = num_covered / total_pois
+                scale_factor = 1.0 + 2.0 * coverage_ratio
+                
                 self.covered[i] = True
+                lm.covered = True
                 lm.color = np.array([0.75, 0.25, 0.25])  # red = covered
-                rew += 10.0 / (1.0 + best_cov_trace)
+                rew += base_reward * scale_factor
+                
+                # Update num_covered for subsequent POIs covered in same step
+                num_covered += 1
+            
             elif best_dist < self.r_c and best_cov_trace >= self.cov_c:
                 # Agent is close to POI but covariance is too high to cover it
                 # Penalty inversely proportional to remaining covariance budget
-                rew -= float(np.exp(best_cov_trace - self.cov_c))
+                agent.color= np.array([0.75, 0.75, 0.25])  # yellow = close but not covered
+                rew -= 0.05 #float(np.exp(best_cov_trace - self.cov_c))
 
         # Big bonus reward if all POIs are covered
         if all(self.covered):
-            rew += 50.0
+            rew += 5.0
 
         return rew
 
@@ -486,7 +508,8 @@ class Scenario(BaseScenario):
             self_heading        (1)
             self_belief_pos     (2)   -- agent's believed position (not true pos)
             self_cov_trace      (1)
-            poi_rel_positions   (N_r * 2)  -- relative to belief
+            in_gpsd_zone        (1)   -- whether belief pos is in GPS denied zone
+            poi_rel_positions, and coverage states   (N_r * 2)  -- relative to belief
             other_agent_rel_pos ((N_a-1) * 2) -- relative to belief
             other_agent_comm    ((N_a-1) * 2)   [range, cov_trace]
         """
@@ -494,11 +517,14 @@ class Scenario(BaseScenario):
         heading = np.array([agent.state.heading if agent.state.heading is not None else 0.0])
         belief_pos = agent.state.p_belief if agent.state.p_belief is not None else agent.state.p_pos
         cov_trace = np.array([self._get_cov_trace(agent, world)])
+        in_gpsd_zone = np.array([float(world.is_in_gpsd_zone(belief_pos))])
 
-        # Relative positions of all points of interest (relative to belief)
-        poi_rel_pos = []
+        # Relative positions of all points of interest (relative to belief) with coverage states
+        poi_obs = []
         for lm in world.landmarks:
-            poi_rel_pos.append(lm.state.p_pos - belief_pos)
+            rel_pos = lm.state.p_pos - belief_pos
+            covered_state = float(getattr(lm, 'covered', False))
+            poi_obs.append(np.concatenate([rel_pos, [covered_state]]))
 
         # Other agents: relative position (belief-to-belief) + communication (range, cov_trace)
         other_pos = []
@@ -519,6 +545,6 @@ class Scenario(BaseScenario):
             other_comm.append(np.array([range_meas, other_cov]))
 
         return np.concatenate(
-            [heading] + [belief_pos] + [cov_trace]
-            + poi_rel_pos + other_pos + other_comm
+            [heading] + [belief_pos] + [cov_trace] + [in_gpsd_zone]
+            + poi_obs + other_pos + other_comm
         )
