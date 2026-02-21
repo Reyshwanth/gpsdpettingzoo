@@ -49,28 +49,115 @@ class Agent(nn.Module):
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
 
+class CNNAgent(nn.Module):
+    """CNN + MLP policy/value network (must match train_gpsd_cnn.py)."""
+
+    POI_VEC_START = 5
+    POI_CHANNELS  = 3
+    CNN_FEAT_DIM  = 128
+
+    def __init__(self, num_agents: int, n_cells: int, act_dim: int):
+        super().__init__()
+        self.num_agents = num_agents
+        self.n_cells = n_cells
+        self.poi_end = self.POI_VEC_START + n_cells * n_cells * self.POI_CHANNELS
+        self.vec_dim = self.POI_VEC_START + (num_agents - 1) * 4
+
+        self.cnn = nn.Sequential(
+            layer_init(nn.Conv2d(self.POI_CHANNELS, 16, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(16, 32, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((2, 2)),
+            nn.Flatten(),
+        )
+
+        combined_dim = self.CNN_FEAT_DIM + self.vec_dim
+        self.network = nn.Sequential(
+            layer_init(nn.Linear(combined_dim, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+        )
+        self.actor = layer_init(nn.Linear(256, act_dim), std=0.01)
+        self.critic = layer_init(nn.Linear(256, 1), std=1)
+
+    def _split_obs(self, x):
+        vec_part1 = x[:, :self.POI_VEC_START]
+        poi_flat  = x[:, self.POI_VEC_START:self.poi_end]
+        vec_part2 = x[:, self.poi_end:]
+        vec = torch.cat([vec_part1, vec_part2], dim=1)
+        poi_img = poi_flat.reshape(-1, self.n_cells, self.n_cells, self.POI_CHANNELS)
+        poi_img = poi_img.permute(0, 3, 1, 2)
+        return vec, poi_img
+
+    def _encode(self, x):
+        vec, poi_img = self._split_obs(x)
+        cnn_features = self.cnn(poi_img)
+        combined = torch.cat([vec, cnn_features], dim=1)
+        return self.network(combined)
+
+    def get_value(self, x):
+        return self.critic(self._encode(x))
+
+    def get_action_and_value(self, x, action=None):
+        hidden = self._encode(x)
+        logits = self.actor(hidden)
+        probs = Categorical(logits=logits)
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+
+
 # ---------------------------------------------------------------------------
 # Policy evaluation
 # ---------------------------------------------------------------------------
-def load_policy(model_path, obs_dim, act_dim, device):
-    """Load a trained policy from disk."""
-    agent = Agent(obs_dim, act_dim).to(device)
+def load_checkpoint_args(model_path):
+    """Load the training args saved in a checkpoint (if available)."""
+    checkpoint = torch.load(model_path, map_location="cpu")
+    if isinstance(checkpoint, dict) and 'args' in checkpoint:
+        return checkpoint['args']
+    return {}
+
+
+def load_policy(model_path, obs_dim, act_dim, device, num_agents=5, n_cells=4):
+    """Load a trained policy from disk (auto-detects MLP vs CNN architecture)."""
     checkpoint = torch.load(model_path, map_location=device)
-    
-    # Handle both checkpoint format and raw state dict format
+
+    # Detect architecture from checkpoint metadata
+    arch = None
+    ckpt_n_cells = n_cells
+    ckpt_num_agents = num_agents
+    if isinstance(checkpoint, dict):
+        arch = checkpoint.get('arch', None)
+        ckpt_n_cells = checkpoint.get('n_cells', n_cells)
+        ckpt_args = checkpoint.get('args', {})
+        ckpt_num_agents = ckpt_args.get('num_agents', num_agents)
+
+    if arch == 'cnn':
+        agent = CNNAgent(ckpt_num_agents, ckpt_n_cells, act_dim).to(device)
+    else:
+        agent = Agent(obs_dim, act_dim).to(device)
+
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        # Checkpoint format (includes optimizer state, args, etc.)
         agent.load_state_dict(checkpoint['model_state_dict'])
     else:
-        # Raw state dict format
         agent.load_state_dict(checkpoint)
-    
+
     agent.eval()
     return agent
 
 
-def evaluate_policy(policy_agent, device, num_episodes=5, max_cycles=100, seed=None):
-    """Evaluate a policy and return performance metrics."""
+def evaluate_policy(policy_agent, device, num_episodes=5, max_cycles=100, seed=None, env_kwargs=None):
+    """Evaluate a policy and return performance metrics.
+    
+    Args:
+        env_kwargs: dict of environment parameters (cell_width, num_agents, speed, r_c, cov_c, etc.)
+                    extracted from the checkpoint's saved args. Falls back to defaults if not provided.
+    """
+    if env_kwargs is None:
+        env_kwargs = {}
+    
     results = {
         'rewards': [],
         'coverage': [],
@@ -78,11 +165,21 @@ def evaluate_policy(policy_agent, device, num_episodes=5, max_cycles=100, seed=N
         'final_coverage_pct': [],
     }
     
+    # Extract env params from checkpoint args, with sensible defaults
+    N_a = env_kwargs.get('num_agents', 5)
+    cell_width = env_kwargs.get('cell_width', 0.25)
+    speed = env_kwargs.get('speed', 0.2)
+    r_c = env_kwargs.get('r_c', 0.3)
+    cov_c = env_kwargs.get('cov_c', 0.25)
+    
     for episode in range(num_episodes):
         e = raw_env(
-            N_a=5,
-            cell_width=0.25,
+            N_a=N_a,
+            cell_width=cell_width,
             max_cycles=max_cycles,
+            speed=speed,
+            r_c=r_c,
+            cov_c=cov_c,
             render_mode=None
         )
         
@@ -164,6 +261,10 @@ def parse_args():
                         help="Random seed for reproducibility")
     parser.add_argument("--include-random", action="store_true",
                         help="Include random baseline policy")
+    parser.add_argument("--cell-width", type=float, default=0.25,
+                        help="Cell width for random baseline (default: 0.25)")
+    parser.add_argument("--num-agents", type=int, default=5,
+                        help="Number of agents for random baseline")
     parser.add_argument("--save-plot", type=str, default=None,
                         help="Save comparison plot to this file")
     return parser.parse_args()
@@ -192,14 +293,7 @@ if __name__ == "__main__":
     print(f"Evaluating {len(policy_paths)} policies with {args.num_episodes} episodes each")
     print()
     
-    # Get observation and action dimensions
-    temp_env = raw_env(N_a=5, cell_width=0.25, max_cycles=100)
-    temp_env.reset()
-    obs_dim = temp_env.observation_space(temp_env.possible_agents[0]).shape[0]
-    act_dim = temp_env.action_space(temp_env.possible_agents[0]).n
-    temp_env.close()
-    
-    # Evaluate each policy
+    # Evaluate each policy (env params are read from each checkpoint)
     all_results = {}
     
     for policy_path, policy_name in zip(policy_paths, policy_names):
@@ -210,8 +304,31 @@ if __name__ == "__main__":
             print(f"  ✗ File not found, skipping")
             continue
         
-        policy_agent = load_policy(policy_path, obs_dim, act_dim, device)
-        results = evaluate_policy(policy_agent, device, args.num_episodes, args.max_cycles, args.seed)
+        # Load training args from checkpoint to get correct env params
+        ckpt_args = load_checkpoint_args(policy_path)
+        cell_width = ckpt_args.get('cell_width', 0.25)
+        N_a = ckpt_args.get('num_agents', 5)
+        speed = ckpt_args.get('speed', 0.2)
+        r_c = ckpt_args.get('r_c', 0.3)
+        cov_c = ckpt_args.get('cov_c', 0.25)
+        
+        # Compute number of POIs for this cell_width
+        zone_size = 1.0  # GPS denied zone spans [-0.5, 0.5]
+        n_cells = int(np.round(zone_size / cell_width))
+        n_pois = n_cells * n_cells
+        print(f"  cell_width={cell_width}, grid={n_cells}x{n_cells}, POIs={n_pois}, N_a={N_a}")
+        
+        # Create a temp env with the correct params to get obs/act dims
+        temp_env = raw_env(N_a=N_a, cell_width=cell_width, max_cycles=100, speed=speed, r_c=r_c, cov_c=cov_c)
+        temp_env.reset()
+        obs_dim = temp_env.observation_space(temp_env.possible_agents[0]).shape[0]
+        act_dim = temp_env.action_space(temp_env.possible_agents[0]).n
+        temp_env.close()
+        print(f"  obs_dim={obs_dim}, act_dim={act_dim}")
+        
+        policy_agent = load_policy(policy_path, obs_dim, act_dim, device,
+                                    num_agents=N_a, n_cells=n_cells)
+        results = evaluate_policy(policy_agent, device, args.num_episodes, args.max_cycles, args.seed, env_kwargs=ckpt_args)
         all_results[policy_name] = results
         
         print(f"  Average reward: {np.mean(results['rewards']):.2f} ± {np.std(results['rewards']):.2f}")
@@ -221,7 +338,8 @@ if __name__ == "__main__":
     # Random baseline
     if args.include_random:
         print(f"\nEvaluating: Random Policy (baseline)")
-        results = evaluate_policy(None, device, args.num_episodes, args.max_cycles, args.seed)
+        random_env_kwargs = {'num_agents': args.num_agents, 'cell_width': args.cell_width}
+        results = evaluate_policy(None, device, args.num_episodes, args.max_cycles, args.seed, env_kwargs=random_env_kwargs)
         all_results['Random'] = results
         print(f"  Average reward: {np.mean(results['rewards']):.2f} ± {np.std(results['rewards']):.2f}")
         print(f"  Average coverage: {np.mean(results['final_coverage_pct']):.1f}% ± {np.std(results['final_coverage_pct']):.1f}%")
