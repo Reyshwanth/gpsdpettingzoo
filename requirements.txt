@@ -1,0 +1,41 @@
+# ============================================================================
+# IMPORTANT: PettingZoo requires Python >= 3.9 and < 3.13
+# If you have Python 3.13+, create a virtual environment with Python 3.12:
+#   python3.12 -m venv venv
+#   source venv/bin/activate  # or: venv\Scripts\activate on Windows
+# ============================================================================
+
+# Core dependencies for GPSD PettingZoo environment and training
+numpy>=1.21.0
+gymnasium>=1.0.0
+torch>=2.0.0
+tensorboard>=2.10.0
+
+# PettingZoo with MPE (Multi-Particle Environment) support
+# pygame is required for MPE rendering
+pygame>=2.3.0
+
+# Environment wrappers and utilities
+supersuit>=3.9.0
+
+# Visualization and logging
+matplotlib>=3.5.0
+wandb>=0.15.0
+imageio>=2.25.0
+imageio-ffmpeg>=0.4.8  # for video encoding support
+
+# JAX GPU-accelerated training (train_gpsd_ppo_jax.py)
+jax>=0.4.20
+jaxlib>=0.4.20
+flax>=0.8.0
+optax>=0.1.7
+distrax>=0.1.5
+
+# Optional: for running tests
+pytest>=8.0.0
+
+# ============================================================================
+# Installation instructions:
+# 1. Install dependencies: pip install -r requirements.txt
+# 2. Install local PettingZoo with GPSD: pip install -e PettingZoo/
+# ============================================================================

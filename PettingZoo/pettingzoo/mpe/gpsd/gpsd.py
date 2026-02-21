@@ -137,6 +137,16 @@ class raw_env(SimpleEnv, EzPickle):
         )
         self.metadata["name"] = "gpsd_v1"
 
+    def _execute_world_step(self):
+        """Override to inject coverage metrics into agent info dicts."""
+        super()._execute_world_step()
+        if hasattr(self.scenario, 'covered') and self.scenario.covered:
+            coverage_ratio = sum(self.scenario.covered) / len(self.scenario.covered)
+        else:
+            coverage_ratio = 0.0
+        for agent_name in self.agents:
+            self.infos[agent_name]["coverage_ratio"] = coverage_ratio
+
     def _set_action(self, action, agent, action_space, time=None):
         """Override: map discrete action index to a scalar turn rate (omega).
 
@@ -164,6 +174,9 @@ class raw_env(SimpleEnv, EzPickle):
     def draw(self):
         """Override draw to add GPS denied zone visualization and communication links."""
         import pygame
+        
+        # Update agent colors based on covariance before rendering
+        self.scenario._update_agent_colors(self.world)
         
         # Call parent draw to render entities
         super().draw()
@@ -383,6 +396,62 @@ class Scenario(BaseScenario):
             return np.trace(p_cov)
         return 0.0
 
+    def _update_agent_colors(self, world):
+        """Update agent colors based on covariance trace.
+        
+        Normal (blue) when cov < threshold
+        Violet when cov >= threshold
+        Darker (approaching black) as covariance increases
+        """
+        cov_threshold = self.cov_c
+        
+        for agent in world.agents:
+            cov_trace = self._get_cov_trace(agent, world)
+            
+            if cov_trace < cov_threshold:
+                # Below threshold: blue color
+                safety= cov_threshold-cov_trace
+                decay_rate=20.0
+                decay_factor = np.exp(-decay_rate * safety)
+                agent.color = np.array([0.25, 0.75, 0.25]) * decay_factor + np.array([0.35, 0.35, 0.85]) * (1 - decay_factor)
+            else:
+                # Above threshold: violet fading to black
+                # Compute how much over the threshold we are
+                excess = cov_trace - cov_threshold
+                
+                # Use exponential decay to darken color
+                # At threshold: bright violet (0.8, 0.4, 0.8)
+                # As excess increases: approaches black (0, 0, 0)
+                # decay_factor ranges from 1.0 (at threshold) to ~0 (very high cov)
+                decay_rate = 20.0  # controls how quickly it darkens
+                decay_factor = np.exp(-decay_rate * excess)
+                
+                # Violet base color
+                violet = np.array([0.8, 0.4, 0.8])
+                
+                # Interpolate between violet and black based on decay_factor
+                agent.color = violet * decay_factor
+
+    def _world_to_body_frame(self, rel_pos_world, heading):
+        """Transform world-frame relative position to agent's body frame.
+        
+        Args:
+            rel_pos_world: (2,) array [dx, dy] in world frame
+            heading: agent's heading angle in radians (0 = facing +x, counterclockwise positive)
+        
+        Returns:
+            (2,) array [x_body, y_body] where:
+                +x_body is to the right of the agent
+                +y_body is forward (along heading direction)
+        """
+        dx, dy = rel_pos_world
+        cos_h = np.cos(heading)
+        sin_h = np.sin(heading)
+        # Rotation from world to body frame
+        x_body = sin_h * dx - cos_h * dy  # right
+        y_body = cos_h * dx + sin_h * dy  # forward
+        return np.array([x_body, y_body])
+
     # ------------------------------------------------------------------
     # Reward
     # ------------------------------------------------------------------
@@ -401,7 +470,7 @@ class Scenario(BaseScenario):
                 continue
             dist = np.sqrt(np.sum(np.square(agent.state.p_pos - other.state.p_pos)))
             if dist <= self.r_c and self._get_cov_trace(other, world) < self.cov_c:
-                rew+=1.0/(1.0 + self._get_cov_trace(other, world))
+                rew+=0.125/(1.0 + self._get_cov_trace(other, world))
 
 
         # Penalty for being in GPS denied zone with high covariance
@@ -412,7 +481,7 @@ class Scenario(BaseScenario):
         else:
             gpsd_center = np.zeros(world.dim_p)
             dist_to_center = np.linalg.norm(agent.state.p_pos - gpsd_center)
-            rew -= 1.0 * np.exp(dist_to_center- 0.5)
+            rew -= 0.2 * np.exp(dist_to_center- 0.5)
             # Penalize moving away from GPS denied zone center
             
 
@@ -448,7 +517,7 @@ class Scenario(BaseScenario):
                 # POI covered! Reward inversely proportional to covariance
                 self.covered[i] = True
                 lm.color = np.array([0.75, 0.25, 0.25])  # red = covered
-                rew += 10.0 / (1.0 + best_cov_trace)
+                rew += 1.0 / (1.0 + best_cov_trace)
             elif best_dist < self.r_c and best_cov_trace >= self.cov_c:
                 # Agent is close to POI but covariance is too high to cover it
                 # Penalty inversely proportional to remaining covariance budget
@@ -456,7 +525,7 @@ class Scenario(BaseScenario):
 
         # Big bonus reward if all POIs are covered
         if all(self.covered):
-            rew += 50.0
+            rew += 5.0
 
         return rew
 
@@ -486,29 +555,35 @@ class Scenario(BaseScenario):
             self_heading        (1)
             self_belief_pos     (2)   -- agent's believed position (not true pos)
             self_cov_trace      (1)
-            poi_rel_positions   (N_r * 2)  -- relative to belief
-            other_agent_rel_pos ((N_a-1) * 2) -- relative to belief
+            poi_rel_positions   (N_r * 2)  -- relative to belief in agent's body frame
+            other_agent_rel_pos ((N_a-1) * 2) -- relative to belief in agent's body frame
             other_agent_comm    ((N_a-1) * 2)   [range, cov_trace]
+        
+        Note: Relative positions are in agent's body frame where +x is right, +y is forward.
         """
         # Own state (use belief, not true position)
-        heading = np.array([agent.state.heading if agent.state.heading is not None else 0.0])
+        heading_val = agent.state.heading if agent.state.heading is not None else 0.0
+        heading = np.array([heading_val])
         belief_pos = agent.state.p_belief if agent.state.p_belief is not None else agent.state.p_pos
         cov_trace = np.array([self._get_cov_trace(agent, world)])
 
-        # Relative positions of all points of interest (relative to belief)
+        # Relative positions of all points of interest (relative to belief, in body frame)
         poi_rel_pos = []
         for lm in world.landmarks:
-            poi_rel_pos.append(lm.state.p_pos - belief_pos)
+            rel_world = lm.state.p_pos - belief_pos
+            rel_body = self._world_to_body_frame(rel_world, heading_val)
+            poi_rel_pos.append(rel_body)
 
-        # Other agents: relative position (belief-to-belief) + communication (range, cov_trace)
+        # Other agents: relative position (belief-to-belief, in body frame) + communication (range, cov_trace)
         other_pos = []
         other_comm = []
         for other in world.agents:
             if other is agent:
                 continue
             other_belief = other.state.p_belief if other.state.p_belief is not None else other.state.p_pos
-            rel = other_belief - belief_pos
-            other_pos.append(rel)
+            rel_world = other_belief - belief_pos
+            rel_body = self._world_to_body_frame(rel_world, heading_val)
+            other_pos.append(rel_body)
             # Noisy range measurement (only if within communication radius)
             true_dist = np.sqrt(np.sum(np.square(agent.state.p_pos - other.state.p_pos)))
             if true_dist <= world.r_c:

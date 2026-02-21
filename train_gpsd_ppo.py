@@ -58,13 +58,13 @@ def parse_args():
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
     parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, cuda will be enabled by default")
-    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
     parser.add_argument("--wandb-project-name", type=str, default="gpsd-ppo",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
-    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="whether to capture a video of the trained agent after training")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="whether to save the final trained model")
@@ -72,11 +72,11 @@ def parse_args():
     # --- GPSD environment parameters ---
     parser.add_argument("--num-agents", type=int, default=5,
         help="number of agents (N_a) in the GPSD environment")
-    parser.add_argument("--cell-width", type=float, default=0.25,
+    parser.add_argument("--cell-width", type=float, default=0.1,
         help="cell width for the POI grid in the GPS denied zone")
-    parser.add_argument("--max-cycles", type=int, default=100,
+    parser.add_argument("--max-cycles", type=int, default=200,
         help="max steps per episode in the GPSD environment")
-    parser.add_argument("--speed", type=float, default=0.1,
+    parser.add_argument("--speed", type=float, default=0.3,
         help="constant forward speed of agents")
     parser.add_argument("--r-c", type=float, default=0.3,
         help="communication/coverage radius")
@@ -128,7 +128,7 @@ def parse_args():
     # fmt: on
     return args
 
-
+#wandbai key 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
 # ---------------------------------------------------------------------------
 # Network helpers
 # ---------------------------------------------------------------------------
@@ -249,7 +249,7 @@ def record_video(args, agent_model, run_name, num_episodes=1):
     if frames:
         os.makedirs(f"runs/{run_name}", exist_ok=True)
         video_path = f"runs/{run_name}/gpsd_trained.mp4"
-        imageio.mimwrite(video_path, frames, fps=30)
+        imageio.mimwrite(video_path, frames, fps=30, codec='libx264')
         print(f"Saved video → {video_path}")
     else:
         print("No frames captured – skipping video save.")
@@ -260,7 +260,7 @@ def record_video(args, agent_model, run_name, num_episodes=1):
 # ===========================================================================
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"gpsd__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"gpsd_{args.seed}_{int(time.time())}"
     print(f"\n{'='*70}")
     print(f"  GPSD PPO Training  —  {run_name}")
     print(f"{'='*70}")
@@ -274,7 +274,7 @@ if __name__ == "__main__":
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            sync_tensorboard=False,
             config=vars(args),
             name=run_name,
             save_code=True,
@@ -349,6 +349,15 @@ if __name__ == "__main__":
     num_updates = args.total_timesteps // args.batch_size
     print(f"Number of PPO updates: {num_updates}\n")
 
+    # --- Manual episode tracking ---
+    # SuperSuit vec envs don't auto-insert "episode" info, so track manually.
+    episode_rewards = np.zeros(args.num_envs, dtype=np.float64)
+    episode_lengths = np.zeros(args.num_envs, dtype=np.int64)
+    episode_coverage = np.zeros(args.num_envs, dtype=np.float64)
+    # Rolling buffers for logging averages
+    recent_returns = []
+    recent_coverage = []
+
     for update in range(1, num_updates + 1):
         # --- Learning rate annealing ---
         if args.anneal_lr:
@@ -381,29 +390,59 @@ if __name__ == "__main__":
             next_termination = torch.Tensor(termination).to(device)
             next_truncation = torch.Tensor(truncation).to(device)
 
-            # --- Log episodic returns ---
-            # SuperSuit's vectorised envs return info as a list of dicts.
-            # When an episode ends the wrapper inserts an "episode" key.
+            # --- Manual episode tracking ---
+            episode_rewards += reward
+            episode_lengths += 1
+
+            # Extract coverage_ratio from info (injected by GPSD env)
             if isinstance(info, (list, tuple)):
                 for idx, item in enumerate(info):
-                    if isinstance(item, dict) and "episode" in item:
-                        agent_idx = idx % args.num_agents
-                        writer.add_scalar(
-                            f"charts/episodic_return_agent{agent_idx}",
-                            item["episode"]["r"],
-                            global_step,
-                        )
-                        writer.add_scalar(
-                            f"charts/episodic_length_agent{agent_idx}",
-                            item["episode"]["l"],
-                            global_step,
-                        )
-                        if agent_idx == 0:
-                            print(
-                                f"  update={update}/{num_updates}  "
-                                f"global_step={global_step}  "
-                                f"agent_{agent_idx}_return={item['episode']['r']:.2f}"
-                            )
+                    if isinstance(item, dict) and "coverage_ratio" in item:
+                        episode_coverage[idx] = item["coverage_ratio"]
+            elif isinstance(info, dict) and "coverage_ratio" in info:
+                # Gymnasium vectorised info format: dict of arrays
+                episode_coverage[:] = info["coverage_ratio"]
+
+            # Detect episode ends and log
+            done_flags = np.maximum(termination, truncation)
+            for idx in range(args.num_envs):
+                if done_flags[idx]:
+                    agent_idx = idx % args.num_agents
+                    ep_ret = episode_rewards[idx]
+                    ep_len = episode_lengths[idx]
+                    ep_cov = episode_coverage[idx]
+
+                    writer.add_scalar(
+                        f"charts/episodic_return_agent{agent_idx}",
+                        ep_ret, global_step,
+                    )
+                    writer.add_scalar(
+                        f"charts/episodic_length_agent{agent_idx}",
+                        ep_len, global_step,
+                    )
+                    writer.add_scalar(
+                        f"charts/coverage_ratio_agent{agent_idx}",
+                        ep_cov, global_step,
+                    )
+                    recent_returns.append(ep_ret)
+                    recent_coverage.append(ep_cov)
+
+                    # Reset accumulators for this slot
+                    episode_rewards[idx] = 0.0
+                    episode_lengths[idx] = 0
+                    episode_coverage[idx] = 0.0
+
+            # Log rolling averages every 20 episodes
+            if len(recent_returns) >= 20:
+                avg_ret = np.mean(recent_returns[-100:])
+                avg_cov = np.mean(recent_coverage[-100:])
+                writer.add_scalar("charts/avg_episodic_return", avg_ret, global_step)
+                writer.add_scalar("charts/avg_coverage_ratio", avg_cov, global_step)
+                if args.track:
+                    wandb.log({
+                        "charts/avg_episodic_return": avg_ret,
+                        "charts/avg_coverage_ratio": avg_cov,
+                    }, step=global_step)
 
         # ===============================================================
         # Advantage estimation (GAE)
@@ -521,7 +560,28 @@ if __name__ == "__main__":
         sps = int(global_step / (time.time() - start_time))
         writer.add_scalar("charts/SPS", sps, global_step)
 
+        # --- Direct W&B logging (avoids TensorBoard pod) ---
+        if args.track:
+            log_dict = {
+                "charts/learning_rate": optimizer.param_groups[0]["lr"],
+                "charts/SPS": sps,
+                "losses/value_loss": v_loss.item(),
+                "losses/policy_loss": pg_loss.item(),
+                "losses/entropy": entropy_loss.item(),
+                "losses/old_approx_kl": old_approx_kl.item(),
+                "losses/approx_kl": approx_kl.item(),
+                "losses/clipfrac": np.mean(clipfracs),
+                "losses/explained_variance": explained_var,
+            }
+            if recent_returns:
+                log_dict["charts/avg_episodic_return"] = np.mean(recent_returns[-100:])
+            if recent_coverage:
+                log_dict["charts/avg_coverage_ratio"] = np.mean(recent_coverage[-100:])
+            wandb.log(log_dict, step=global_step)
+
         if update % 10 == 0 or update == num_updates:
+            avg_r = np.mean(recent_returns[-100:]) if recent_returns else float('nan')
+            avg_c = np.mean(recent_coverage[-100:]) if recent_coverage else float('nan')
             print(
                 f"  [Update {update:>4}/{num_updates}]  "
                 f"step={global_step:>8}  "
@@ -529,6 +589,8 @@ if __name__ == "__main__":
                 f"pg_loss={pg_loss.item():+.4f}  "
                 f"v_loss={v_loss.item():.4f}  "
                 f"entropy={entropy_loss.item():.4f}  "
+                f"avg_return={avg_r:.2f}  "
+                f"avg_coverage={avg_c:.3f}  "
                 f"explained_var={explained_var:.3f}"
             )
 
