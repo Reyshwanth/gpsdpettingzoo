@@ -1,0 +1,18 @@
+program: train_gpsd_mappo_transformer.py
+method: grid
+metric:
+  name: charts/avg_coverage_ratio
+  goal: maximize
+parameters:
+  clip_coef:
+    values: [0.05, 0.1, 0.15]
+  critic_lr_multiplier:
+    values: [3.0, 5.0, 7.0]
+command:
+  - ${env}
+  - python3
+  - ${program}
+  - --clip-coef
+  - ${clip_coef}
+  - --critic-lr-multiplier
+  - ${critic_lr_multiplier}

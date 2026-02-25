@@ -76,21 +76,21 @@ def parse_args():
         help="cell width for the POI grid in the GPS denied zone")
     parser.add_argument("--max-cycles", type=int, default=200,
         help="max steps per episode in the GPSD environment")
-    parser.add_argument("--speed", type=float, default=0.3,
+    parser.add_argument("--speed", type=float, default=0.1,
         help="constant forward speed of agents")
     parser.add_argument("--r-c", type=float, default=0.3,
         help="communication/coverage radius")
-    parser.add_argument("--cov-c", type=float, default=0.015,
+    parser.add_argument("--cov-c", type=float, default=0.05,
         help="coverage covariance trace threshold")
 
     # --- PPO hyperparameters ---
-    parser.add_argument("--total-timesteps", type=int, default=2_000_000,
+    parser.add_argument("--total-timesteps", type=int, default=5_000_000,
         help="total timesteps of the experiment")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=40,
         help="the number of parallel environment slots (must be a multiple of --num-agents)")
-    parser.add_argument("--num-steps", type=int, default=128,
+    parser.add_argument("--num-steps", type=int, default=256,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="toggle learning rate annealing for policy and value networks")
@@ -108,7 +108,7 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="toggles whether to use a clipped loss for the value function")
-    parser.add_argument("--ent-coef", type=float, default=0.01,
+    parser.add_argument("--ent-coef", type=float, default=0.001,
         help="coefficient of the entropy")
     parser.add_argument("--vf-coef", type=float, default=0.5,
         help="coefficient of the value function")
@@ -116,6 +116,8 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
+    parser.add_argument("--norm-reward", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="toggles reward normalization using running mean/std")
 
     args = parser.parse_args()
 
@@ -129,6 +131,33 @@ def parse_args():
     return args
 
 #wandbai key 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
+# ---------------------------------------------------------------------------
+# Reward normalisation (Welford online mean/variance)
+# ---------------------------------------------------------------------------
+class RunningMeanStd:
+    """Tracks running mean and variance using Welford's algorithm."""
+    def __init__(self, epsilon=1e-8):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = epsilon
+
+    def update(self, x):
+        """Update statistics with a batch of values (numpy array)."""
+        batch_mean = np.mean(x)
+        batch_var = np.var(x)
+        batch_count = x.size
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        self.mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        self.var = (m_a + m_b + np.square(delta) * self.count * batch_count / tot_count) / tot_count
+        self.count = tot_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
+
 # ---------------------------------------------------------------------------
 # Network helpers
 # ---------------------------------------------------------------------------
@@ -348,7 +377,10 @@ if __name__ == "__main__":
     next_truncation = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
     print(f"Number of PPO updates: {num_updates}\n")
-    
+
+    # --- Reward normalization ---
+    reward_rms = RunningMeanStd() if args.norm_reward else None
+
     # --- Manual episode tracking ---
     # SuperSuit vec envs don't auto-insert "episode" info, so track manually.
     episode_rewards = np.zeros(args.num_envs, dtype=np.float64)
@@ -363,394 +395,423 @@ if __name__ == "__main__":
     episode_lengths_buffer = []  # Track episode lengths
     individual_returns_buffer = {i: [] for i in range(args.num_agents)}  # Per-agent returns
 
-    for update in range(1, num_updates + 1):
-        # --- Learning rate annealing ---
-        if args.anneal_lr:
-            frac = 1.0 - (update - 1.0) / num_updates
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+    try:
+        for update in range(1, num_updates + 1):
+            # --- Learning rate annealing ---
+            if args.anneal_lr:
+                frac = 1.0 - (update - 1.0) / num_updates
+                lrnow = frac * args.learning_rate
+                optimizer.param_groups[0]["lr"] = lrnow
 
-        # ===============================================================
-        # Rollout phase – collect experience
-        # ===============================================================
-        coverage_ratios = []  # Track coverage ratios during rollout
-        for step in range(0, args.num_steps):
-            global_step += args.num_envs
-            obs[step] = next_obs
-            terminations[step] = next_termination
-            truncations[step] = next_truncation
+            # --- Entropy coefficient linear decay ---
+            ent_coef = args.ent_coef * (1.0 - (update - 1.0) / num_updates)
 
-            # Action selection
+            # ===============================================================
+            # Rollout phase – collect experience
+            # ===============================================================
+            coverage_ratios = []  # Track coverage ratios during rollout
+            for step in range(0, args.num_steps):
+                global_step += args.num_envs
+                obs[step] = next_obs
+                terminations[step] = next_termination
+                truncations[step] = next_truncation
+
+                # Action selection
+                with torch.no_grad():
+                    action, logprob, _, value = agent.get_action_and_value(next_obs)
+                    values[step] = value.flatten()
+                actions[step] = action
+                logprobs[step] = logprob
+
+                # Environment step
+                next_obs, reward, termination, truncation, info = envs.step(
+                    action.cpu().numpy()
+                )
+                reward_array = np.array(reward, dtype=np.float64)
+                if reward_rms is not None:
+                    reward_rms.update(reward_array)
+                    reward_array = reward_rms.normalize(reward_array)
+                rewards[step] = torch.tensor(reward_array, dtype=torch.float32).to(device).view(-1)
+                next_obs = torch.Tensor(next_obs).to(device)
+                next_termination = torch.Tensor(termination).to(device)
+                next_truncation = torch.Tensor(truncation).to(device)
+
+                # --- Track coverage ratios ---
+                if isinstance(info, (list, tuple)):
+                    step_coverage_ratios = []
+                    for idx, item in enumerate(info):
+                        if isinstance(item, dict) and 'coverage_ratio' in item:
+                            step_coverage_ratios.append(item['coverage_ratio'])
+                    if step_coverage_ratios:
+                        coverage_ratios.append(np.mean(step_coverage_ratios))
+
+                # --- Manual episode tracking ---
+                episode_rewards += reward
+                episode_lengths += 1
+
+                # Extract coverage_ratio from info (injected by GPSD env)
+                if isinstance(info, (list, tuple)):
+                    # Track episodes that completed in this step
+                    completed_episodes_this_step = []
+                    
+                    for idx, item in enumerate(info):
+                        if isinstance(item, dict) and "coverage_ratio" in item:
+                            episode_coverage[idx] = item["coverage_ratio"]
+                elif isinstance(info, dict) and "coverage_ratio" in info:
+                    # Gymnasium vectorised info format: dict of arrays
+                    episode_coverage[:] = info["coverage_ratio"]
+
+                # Detect episode ends and log
+                done_flags = np.maximum(termination, truncation)
+                for idx in range(args.num_envs):
+                    if done_flags[idx]:
+                        agent_idx = idx % args.num_agents
+                        ep_ret = episode_rewards[idx]
+                        ep_len = episode_lengths[idx]
+                        ep_cov = episode_coverage[idx]
+
+                        writer.add_scalar(
+                            f"charts/episodic_return_agent{agent_idx}",
+                            ep_ret, global_step,
+                        )
+                        writer.add_scalar(
+                            f"charts/episodic_length_agent{agent_idx}",
+                            ep_len, global_step,
+                        )
+                        writer.add_scalar(
+                            f"charts/coverage_ratio_agent{agent_idx}",
+                            ep_cov, global_step,
+                        )
+                        recent_returns.append(ep_ret)
+                        recent_coverage.append(ep_cov)
+
+                        # Reset accumulators for this slot
+                        episode_rewards[idx] = 0.0
+                        episode_lengths[idx] = 0
+                        episode_coverage[idx] = 0.0
+
+                # Log rolling averages every 20 episodes
+                if len(recent_returns) >= 20:
+                    avg_ret = np.mean(recent_returns[-100:])
+                    avg_cov = np.mean(recent_coverage[-100:])
+                    writer.add_scalar("charts/avg_episodic_return", avg_ret, global_step)
+                    writer.add_scalar("charts/avg_coverage_ratio", avg_cov, global_step)
+                    if args.track:
+                        wandb.log({
+                            "charts/avg_episodic_return": avg_ret,
+                            "charts/avg_coverage_ratio": avg_cov,
+                        }, step=global_step)
+
+            # ===============================================================
+            # Advantage estimation (GAE)
+            # ===============================================================
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
-            actions[step] = action
-            logprobs[step] = logprob
-
-            # Environment step
-            next_obs, reward, termination, truncation, info = envs.step(
-                action.cpu().numpy()
-            )
-            rewards[step] = torch.tensor(reward, dtype=torch.float32).to(device).view(-1)
-            next_obs = torch.Tensor(next_obs).to(device)
-            next_termination = torch.Tensor(termination).to(device)
-            next_truncation = torch.Tensor(truncation).to(device)
-
-            # --- Track coverage ratios ---
-            if isinstance(info, (list, tuple)):
-                step_coverage_ratios = []
-                for idx, item in enumerate(info):
-                    if isinstance(item, dict) and 'coverage_ratio' in item:
-                        step_coverage_ratios.append(item['coverage_ratio'])
-                if step_coverage_ratios:
-                    coverage_ratios.append(np.mean(step_coverage_ratios))
-
-            # --- Manual episode tracking ---
-            episode_rewards += reward
-            episode_lengths += 1
-
-            # Extract coverage_ratio from info (injected by GPSD env)
-            if isinstance(info, (list, tuple)):
-                # Track episodes that completed in this step
-                completed_episodes_this_step = []
-                
-                for idx, item in enumerate(info):
-                    if isinstance(item, dict) and "coverage_ratio" in item:
-                        episode_coverage[idx] = item["coverage_ratio"]
-            elif isinstance(info, dict) and "coverage_ratio" in info:
-                # Gymnasium vectorised info format: dict of arrays
-                episode_coverage[:] = info["coverage_ratio"]
-
-            # Detect episode ends and log
-            done_flags = np.maximum(termination, truncation)
-            for idx in range(args.num_envs):
-                if done_flags[idx]:
-                    agent_idx = idx % args.num_agents
-                    ep_ret = episode_rewards[idx]
-                    ep_len = episode_lengths[idx]
-                    ep_cov = episode_coverage[idx]
-
-                    writer.add_scalar(
-                        f"charts/episodic_return_agent{agent_idx}",
-                        ep_ret, global_step,
+                next_value = agent.get_value(next_obs).reshape(1, -1)
+                advantages = torch.zeros_like(rewards).to(device)
+                lastgaelam = 0
+                next_done = torch.maximum(next_termination, next_truncation)
+                dones = torch.maximum(terminations, truncations)
+                for t in reversed(range(args.num_steps)):
+                    if t == args.num_steps - 1:
+                        nextnonterminal = 1.0 - next_done
+                        nextvalues = next_value
+                    else:
+                        nextnonterminal = 1.0 - dones[t + 1]
+                        nextvalues = values[t + 1]
+                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                    advantages[t] = lastgaelam = (
+                        delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                     )
-                    writer.add_scalar(
-                        f"charts/episodic_length_agent{agent_idx}",
-                        ep_len, global_step,
-                    )
-                    writer.add_scalar(
-                        f"charts/coverage_ratio_agent{agent_idx}",
-                        ep_cov, global_step,
-                    )
-                    recent_returns.append(ep_ret)
-                    recent_coverage.append(ep_cov)
+                returns = advantages + values
 
-                    # Reset accumulators for this slot
-                    episode_rewards[idx] = 0.0
-                    episode_lengths[idx] = 0
-                    episode_coverage[idx] = 0.0
+            # ===============================================================
+            # Flatten the rollout batch
+            # ===============================================================
+            b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+            b_logprobs = logprobs.reshape(-1)
+            b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+            b_advantages = advantages.reshape(-1)
+            b_returns = returns.reshape(-1)
+            b_values = values.reshape(-1)
 
-            # Log rolling averages every 20 episodes
-            if len(recent_returns) >= 20:
-                avg_ret = np.mean(recent_returns[-100:])
-                avg_cov = np.mean(recent_coverage[-100:])
-                writer.add_scalar("charts/avg_episodic_return", avg_ret, global_step)
-                writer.add_scalar("charts/avg_coverage_ratio", avg_cov, global_step)
+            # ===============================================================
+            # Optimisation phase – PPO update
+            # ===============================================================
+            b_inds = np.arange(args.batch_size)
+            clipfracs = []
+            for epoch in range(args.update_epochs):
+                np.random.shuffle(b_inds)
+                for start in range(0, args.batch_size, args.minibatch_size):
+                    end = start + args.minibatch_size
+                    mb_inds = b_inds[start:end]
+
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                        b_obs[mb_inds], b_actions.long()[mb_inds]
+                    )
+                    logratio = newlogprob - b_logprobs[mb_inds]
+                    ratio = logratio.exp()
+
+                    with torch.no_grad():
+                        # Approx KL: http://joschu.net/blog/kl-approx.html
+                        old_approx_kl = (-logratio).mean()
+                        approx_kl = ((ratio - 1) - logratio).mean()
+                        clipfracs += [
+                            ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
+                        ]
+
+                    mb_advantages = b_advantages[mb_inds]
+                    if args.norm_adv:
+                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                            mb_advantages.std() + 1e-8
+                        )
+
+                    # Policy loss
+                    pg_loss1 = -mb_advantages * ratio
+                    pg_loss2 = -mb_advantages * torch.clamp(
+                        ratio, 1 - args.clip_coef, 1 + args.clip_coef
+                    )
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    # Value loss
+                    newvalue = newvalue.view(-1)
+                    if args.clip_vloss:
+                        v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                        v_clipped = b_values[mb_inds] + torch.clamp(
+                            newvalue - b_values[mb_inds],
+                            -args.clip_coef,
+                            args.clip_coef,
+                        )
+                        v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                        v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                        v_loss = 0.5 * v_loss_max.mean()
+                    else:
+                        v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+
+                    entropy_loss = entropy.mean()
+                    loss = pg_loss - ent_coef * entropy_loss + v_loss * args.vf_coef
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    optimizer.step()
+
+                if args.target_kl is not None:
+                    if approx_kl > args.target_kl:
+                        break
+
+            # ===============================================================
+            # Logging
+            # ===============================================================
+            y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+            var_y = np.var(y_true)
+            explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+            writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+            writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+            writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+            writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
+            writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+            writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+            writer.add_scalar("losses/explained_variance", explained_var, global_step)
+
+            # Log reward normalisation statistics
+            if reward_rms is not None:
+                raw_reward_mean = reward_rms.mean
+                raw_reward_std = np.sqrt(reward_rms.var)
+                norm_reward_mean = rewards.mean().item()
+                norm_reward_std = rewards.std().item()
+                writer.add_scalar("rewards/raw_mean", raw_reward_mean, global_step)
+                writer.add_scalar("rewards/raw_std", raw_reward_std, global_step)
+                writer.add_scalar("rewards/normalized_mean", norm_reward_mean, global_step)
+                writer.add_scalar("rewards/normalized_std", norm_reward_std, global_step)
                 if args.track:
                     wandb.log({
-                        "charts/avg_episodic_return": avg_ret,
-                        "charts/avg_coverage_ratio": avg_cov,
+                        "rewards/raw_mean": raw_reward_mean,
+                        "rewards/raw_std": raw_reward_std,
+                        "rewards/normalized_mean": norm_reward_mean,
+                        "rewards/normalized_std": norm_reward_std,
                     }, step=global_step)
 
-        # ===============================================================
-        # Advantage estimation (GAE)
-        # ===============================================================
-        with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
-            next_done = torch.maximum(next_termination, next_truncation)
-            dones = torch.maximum(terminations, truncations)
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = (
-                    delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+            # Log average coverage ratio during rollout
+            if coverage_ratios:
+                avg_coverage_ratio = np.mean(coverage_ratios)
+                writer.add_scalar("charts/avg_coverage_ratio", avg_coverage_ratio, global_step)
+            
+            # ===============================================================
+            # Aggregate Episode Statistics (MARL Metrics)
+            # ===============================================================
+            # Compute rolling statistics over recent episodes
+            if len(episode_returns_buffer) >= 10:  # Require at least 10 episodes
+                # Overall mean episode reward across all agents
+                window_size = min(100, len(episode_returns_buffer))
+                rolling_mean = np.mean(episode_returns_buffer[-window_size:])
+                rolling_std = np.std(episode_returns_buffer[-window_size:])
+                rolling_min = np.min(episode_returns_buffer[-window_size:])
+                rolling_max = np.max(episode_returns_buffer[-window_size:])
+                writer.add_scalar(
+                    "marl/mean_episode_reward_all",
+                    rolling_mean,
+                    global_step,
                 )
-            returns = advantages + values
-
-        # ===============================================================
-        # Flatten the rollout batch
-        # ===============================================================
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
-
-        # ===============================================================
-        # Optimisation phase – PPO update
-        # ===============================================================
-        b_inds = np.arange(args.batch_size)
-        clipfracs = []
-        for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
-
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions.long()[mb_inds]
+                writer.add_scalar(
+                    "marl/std_episode_reward_all",
+                    rolling_std,
+                    global_step,
                 )
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-
-                with torch.no_grad():
-                    # Approx KL: http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [
-                        ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
-                    ]
-
-                mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
-                        mb_advantages.std() + 1e-8
+                writer.add_scalar(
+                    "marl/min_episode_reward",
+                    rolling_min,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "marl/max_episode_reward",
+                    rolling_max,
+                    global_step,
+                )
+                # Total episodes completed so far
+                writer.add_scalar(
+                    "marl/total_episodes_completed",
+                    len(episode_returns_buffer),
+                    global_step,
+                )
+                if args.track:
+                    wandb.log(
+                        {
+                            "avg_reward/rolling_mean_100": rolling_mean,
+                            "avg_reward/rolling_std_100": rolling_std,
+                            "avg_reward/rolling_min_100": rolling_min,
+                            "avg_reward/rolling_max_100": rolling_max,
+                            "avg_reward/total_episodes": len(episode_returns_buffer),
+                        },
+                        step=global_step,
                     )
-
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(
-                    ratio, 1 - args.clip_coef, 1 + args.clip_coef
+            
+            if len(episode_lengths_buffer) >= 10:
+                # Episode length statistics
+                window_size = min(100, len(episode_lengths_buffer))
+                writer.add_scalar(
+                    "marl/mean_episode_length",
+                    np.mean(episode_lengths_buffer[-window_size:]),
+                    global_step,
                 )
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
-                entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
-
-            if args.target_kl is not None:
-                if approx_kl > args.target_kl:
-                    break
-
-        # ===============================================================
-        # Logging
-        # ===============================================================
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        
-        # Log average coverage ratio during rollout
-        if coverage_ratios:
-            avg_coverage_ratio = np.mean(coverage_ratios)
-            writer.add_scalar("charts/avg_coverage_ratio", avg_coverage_ratio, global_step)
-        
-        # ===============================================================
-        # Aggregate Episode Statistics (MARL Metrics)
-        # ===============================================================
-        # Compute rolling statistics over recent episodes
-        if len(episode_returns_buffer) >= 10:  # Require at least 10 episodes
-            # Overall mean episode reward across all agents
-            window_size = min(100, len(episode_returns_buffer))
-            rolling_mean = np.mean(episode_returns_buffer[-window_size:])
-            rolling_std = np.std(episode_returns_buffer[-window_size:])
-            rolling_min = np.min(episode_returns_buffer[-window_size:])
-            rolling_max = np.max(episode_returns_buffer[-window_size:])
-            writer.add_scalar(
-                "marl/mean_episode_reward_all",
-                rolling_mean,
-                global_step,
-            )
-            writer.add_scalar(
-                "marl/std_episode_reward_all",
-                rolling_std,
-                global_step,
-            )
-            writer.add_scalar(
-                "marl/min_episode_reward",
-                rolling_min,
-                global_step,
-            )
-            writer.add_scalar(
-                "marl/max_episode_reward",
-                rolling_max,
-                global_step,
-            )
-            # Total episodes completed so far
-            writer.add_scalar(
-                "marl/total_episodes_completed",
-                len(episode_returns_buffer),
-                global_step,
-            )
-            if args.track:
-                wandb.log(
-                    {
-                        "avg_reward/rolling_mean_100": rolling_mean,
-                        "avg_reward/rolling_std_100": rolling_std,
-                        "avg_reward/rolling_min_100": rolling_min,
-                        "avg_reward/rolling_max_100": rolling_max,
-                        "avg_reward/total_episodes": len(episode_returns_buffer),
-                    },
-                    step=global_step,
+                writer.add_scalar(
+                    "marl/std_episode_length",
+                    np.std(episode_lengths_buffer[-window_size:]),
+                    global_step,
                 )
-        
-        if len(episode_lengths_buffer) >= 10:
-            # Episode length statistics
-            window_size = min(100, len(episode_lengths_buffer))
-            writer.add_scalar(
-                "marl/mean_episode_length",
-                np.mean(episode_lengths_buffer[-window_size:]),
-                global_step,
-            )
-            writer.add_scalar(
-                "marl/std_episode_length",
-                np.std(episode_lengths_buffer[-window_size:]),
-                global_step,
-            )
-        
-        # Individual agent performance vs team average
-        # Check if we have at least 5 episodes per agent
-        min_episodes_per_agent = min(len(individual_returns_buffer[i]) for i in range(args.num_agents))
-        if min_episodes_per_agent >= 5:
-            individual_means = []
-            for agent_id in range(args.num_agents):
-                if individual_returns_buffer[agent_id]:
-                    window = min(20, len(individual_returns_buffer[agent_id]))
-                    agent_mean = np.mean(individual_returns_buffer[agent_id][-window:])
-                    individual_means.append(agent_mean)
+            
+            # Individual agent performance vs team average
+            # Check if we have at least 5 episodes per agent
+            min_episodes_per_agent = min(len(individual_returns_buffer[i]) for i in range(args.num_agents))
+            if min_episodes_per_agent >= 5:
+                individual_means = []
+                for agent_id in range(args.num_agents):
+                    if individual_returns_buffer[agent_id]:
+                        window = min(20, len(individual_returns_buffer[agent_id]))
+                        agent_mean = np.mean(individual_returns_buffer[agent_id][-window:])
+                        individual_means.append(agent_mean)
+                        writer.add_scalar(
+                            f"marl/individual_mean_return_agent{agent_id}",
+                            agent_mean,
+                            global_step,
+                        )
+                
+                if individual_means:
+                    team_mean_return = np.mean(individual_means)
                     writer.add_scalar(
-                        f"marl/individual_mean_return_agent{agent_id}",
-                        agent_mean,
+                        "marl/team_mean_return",
+                        team_mean_return,
                         global_step,
                     )
-            
-            if individual_means:
-                team_mean_return = np.mean(individual_means)
-                writer.add_scalar(
-                    "marl/team_mean_return",
-                    team_mean_return,
-                    global_step,
+                    # Return variance across agents (measure of fairness/balance)
+                    writer.add_scalar(
+                        "marl/return_variance_across_agents",
+                        np.var(individual_means),
+                        global_step,
+                    )
+
+            # Log per-update mean reward across the entire rollout batch
+            batch_mean_reward = rewards.mean().item()
+            writer.add_scalar("charts/batch_mean_reward", batch_mean_reward, global_step)
+            if args.track:
+                wandb.log(
+                    {"avg_reward/batch_mean_reward": batch_mean_reward},
+                    step=global_step,
                 )
-                # Return variance across agents (measure of fairness/balance)
-                writer.add_scalar(
-                    "marl/return_variance_across_agents",
-                    np.var(individual_means),
-                    global_step,
+
+            sps = int(global_step / (time.time() - start_time))
+            writer.add_scalar("charts/SPS", sps, global_step)
+
+            # --- Direct W&B logging (avoids TensorBoard pod) ---
+            if args.track:
+                log_dict = {
+                    "charts/learning_rate": optimizer.param_groups[0]["lr"],
+                    "charts/SPS": sps,
+                    "losses/value_loss": v_loss.item(),
+                    "losses/policy_loss": pg_loss.item(),
+                    "losses/entropy": entropy_loss.item(),
+                    "losses/old_approx_kl": old_approx_kl.item(),
+                    "losses/approx_kl": approx_kl.item(),
+                    "losses/clipfrac": np.mean(clipfracs),
+                    "losses/explained_variance": explained_var,
+                }
+                if recent_returns:
+                    log_dict["charts/avg_episodic_return"] = np.mean(recent_returns[-100:])
+                if recent_coverage:
+                    log_dict["charts/avg_coverage_ratio"] = np.mean(recent_coverage[-100:])
+                wandb.log(log_dict, step=global_step)
+
+            if update % 10 == 0 or update == num_updates:
+                avg_r = np.mean(recent_returns[-100:]) if recent_returns else float('nan')
+                avg_c = np.mean(recent_coverage[-100:]) if recent_coverage else float('nan')
+                print(
+                    f"  [Update {update:>4}/{num_updates}]  "
+                    f"step={global_step:>8}  "
+                    f"SPS={sps:>5}  "
+                    f"pg_loss={pg_loss.item():+.4f}  "
+                    f"v_loss={v_loss.item():.4f}  "
+                    f"entropy={entropy_loss.item():.4f}  "
+                    f"avg_return={avg_r:.2f}  "
+                    f"avg_coverage={avg_c:.3f}  "
+                    f"explained_var={explained_var:.3f}"
                 )
+                
+                #if recent_mean_return is not None:
+                #    stats_str += f"  mean_ret={recent_mean_return:.2f}"
+                #if recent_mean_length is not None:
+                #    stats_str += f"  mean_len={recent_mean_length:.1f}"
+                #
+                #print(stats_str)
 
-        # Log per-update mean reward across the entire rollout batch
-        batch_mean_reward = rewards.mean().item()
-        writer.add_scalar("charts/batch_mean_reward", batch_mean_reward, global_step)
-        if args.track:
-            wandb.log(
-                {"avg_reward/batch_mean_reward": batch_mean_reward},
-                step=global_step,
-            )
+    except KeyboardInterrupt:
+        print(f"\n\nTraining interrupted by user at step {global_step}.")
+    finally:
+        # ==================================================================
+        # Post-training (runs on normal completion AND on Ctrl+C)
+        # ==================================================================
+        elapsed = time.time() - start_time
+        print(f"\n{'='*70}")
+        print(f"  Saving checkpoint...  Total time: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
+        print(f"  Final SPS: {int(global_step / elapsed)}")
+        print(f"{'='*70}")
 
-        sps = int(global_step / (time.time() - start_time))
-        writer.add_scalar("charts/SPS", sps, global_step)
+        # --- Save model ---
+        if args.save_model:
+            os.makedirs(f"runs/{run_name}", exist_ok=True)
+            model_path = f"runs/{run_name}/gpsd_ppo_agent.pt"
+            torch.save({
+                "model_state_dict": agent.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "args": vars(args),
+                "global_step": global_step,
+            }, model_path)
+            print(f"  Model saved → {model_path}")
 
-        # --- Direct W&B logging (avoids TensorBoard pod) ---
-        if args.track:
-            log_dict = {
-                "charts/learning_rate": optimizer.param_groups[0]["lr"],
-                "charts/SPS": sps,
-                "losses/value_loss": v_loss.item(),
-                "losses/policy_loss": pg_loss.item(),
-                "losses/entropy": entropy_loss.item(),
-                "losses/old_approx_kl": old_approx_kl.item(),
-                "losses/approx_kl": approx_kl.item(),
-                "losses/clipfrac": np.mean(clipfracs),
-                "losses/explained_variance": explained_var,
-            }
-            if recent_returns:
-                log_dict["charts/avg_episodic_return"] = np.mean(recent_returns[-100:])
-            if recent_coverage:
-                log_dict["charts/avg_coverage_ratio"] = np.mean(recent_coverage[-100:])
-            wandb.log(log_dict, step=global_step)
+        # --- Record video ---
+        if args.capture_video:
+            record_video(args, agent, run_name)
 
-        if update % 10 == 0 or update == num_updates:
-            avg_r = np.mean(recent_returns[-100:]) if recent_returns else float('nan')
-            avg_c = np.mean(recent_coverage[-100:]) if recent_coverage else float('nan')
-            print(
-                f"  [Update {update:>4}/{num_updates}]  "
-                f"step={global_step:>8}  "
-                f"SPS={sps:>5}  "
-                f"pg_loss={pg_loss.item():+.4f}  "
-                f"v_loss={v_loss.item():.4f}  "
-                f"entropy={entropy_loss.item():.4f}  "
-                f"avg_return={avg_r:.2f}  "
-                f"avg_coverage={avg_c:.3f}  "
-                f"explained_var={explained_var:.3f}"
-            )
-            
-            if recent_mean_return is not None:
-                stats_str += f"  mean_ret={recent_mean_return:.2f}"
-            if recent_mean_length is not None:
-                stats_str += f"  mean_len={recent_mean_length:.1f}"
-            
-            print(stats_str)
-
-    # ==================================================================
-    # Post-training
-    # ==================================================================
-    elapsed = time.time() - start_time
-    print(f"\n{'='*70}")
-    print(f"  Training complete!  Total time: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
-    print(f"  Final SPS: {int(global_step / elapsed)}")
-    print(f"{'='*70}")
-
-    # --- Save model ---
-    if args.save_model:
-        os.makedirs(f"runs/{run_name}", exist_ok=True)
-        model_path = f"runs/{run_name}/gpsd_ppo_agent.pt"
-        torch.save({
-            "model_state_dict": agent.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "args": vars(args),
-            "global_step": global_step,
-        }, model_path)
-        print(f"  Model saved → {model_path}")
-
-    # --- Record video ---
-    if args.capture_video:
-        record_video(args, agent, run_name)
-
-    envs.close()
-    writer.close()
-    print("Done.")
+        envs.close()
+        writer.close()
+        print("Done.")

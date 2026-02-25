@@ -45,7 +45,7 @@ compare_all() {
 compare_recent() {
     N=${1:-3}
     echo -e "${GREEN}Comparing $N most recent policies...${NC}"
-    POLICIES=$(ls -t runs/*/gpsd_ppo_agent.pt 2>/dev/null | head -$N | tr '\n' ' ')
+    POLICIES=$(ls -t runs/*/gpsd_mappo_agent.pt 2>/dev/null | head -$N | tr '\n' ' ')
     if [ -z "$POLICIES" ]; then
         echo -e "${YELLOW}No trained policies found. Train a model first!${NC}"
         exit 1
@@ -76,8 +76,35 @@ case "$1" in
             echo -e "${YELLOW}Usage: $0 test <policy_path> [options]${NC}"
             exit 1
         fi
-        shift
-        python3 test_gpsd.py --policy "$@"
+            # Get the first argument (policy path or run directory)
+            POLICY_ARG="$2"
+            # remove the command and the policy arg from the positional params
+            shift 2
+
+            # If the provided argument is a directory, look for a .pt file inside
+            if [ -d "$POLICY_ARG" ]; then
+                PTFILE=$(ls "$POLICY_ARG"/*.pt 2>/dev/null | head -1)
+                if [ -z "$PTFILE" ]; then
+                    echo -e "${YELLOW}No .pt file found in $POLICY_ARG${NC}"
+                    exit 1
+                fi
+                POLICY_PATH="$PTFILE"
+            else
+                # If user passed just the run id (e.g. mappo_1_1771948263), try runs/<id>
+                if [ -d "runs/$POLICY_ARG" ]; then
+                    PTFILE=$(ls "runs/$POLICY_ARG"/*.pt 2>/dev/null | head -1)
+                    if [ -n "$PTFILE" ]; then
+                        POLICY_PATH="$PTFILE"
+                    fi
+                fi
+
+                # If still unset, assume the user passed a direct file path or pattern
+                if [ -z "$POLICY_PATH" ]; then
+                    POLICY_PATH="$POLICY_ARG"
+                fi
+            fi
+
+            python3 test_gpsd.py --policy "$POLICY_PATH" "$@"
         ;;
     random)
         shift
@@ -101,7 +128,7 @@ case "$1" in
         echo "  $0 latest"
         echo "  $0 latest --num-episodes 3"
         echo "  $0 random"
-        echo "  $0 test runs/gpsd__train_gpsd_ppo__1__1770837747/gpsd_ppo_agent.pt"
+        echo "  $0 test runs/mappo_1_1771948263 --plot-rewards --plot-ratios"
         echo "  $0 compare"
         echo "  $0 compare --save-plot results.png"
         echo "  $0 compare-recent 5"

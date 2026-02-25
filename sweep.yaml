@@ -1,0 +1,19 @@
+program: train_gpsd_mappo.py
+method: grid
+project: gpsd-ppo
+name: local_ratio_x_clip_coef_sweep
+
+parameters:
+  local_ratio:
+    values: [0.95, 0.975, 0.99]
+  clip_coef:
+    values: [0.05, 0.1, 0.15]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --local-ratio=${local_ratio}
+  - --clip-coef=${clip_coef}
+  - --track=True
+  - --seed=1

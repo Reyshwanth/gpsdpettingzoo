@@ -4,6 +4,7 @@ import sys
 import argparse
 import os
 import glob
+import pickle
 sys.path.insert(0, "PettingZoo")
 from pettingzoo.mpe.gpsd.gpsd import env, raw_env, parallel_env
 import numpy as np
@@ -109,11 +110,84 @@ class CNNAgent(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MAPPO agent (architecture used by train_gpsd_mappo.py)
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Observation normalisation (must match train_gpsd_mappo.py)
+# ---------------------------------------------------------------------------
+class RunningMeanStdVec:
+    """Tracks per-feature running mean and variance (Welford's algorithm)."""
+    def __init__(self, shape, epsilon=1e-8):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = epsilon
+
+    def normalize(self, x, clip=10.0):
+        mean_t = torch.tensor(self.mean, dtype=torch.float32, device=x.device)
+        std_t = torch.sqrt(torch.tensor(self.var, dtype=torch.float32, device=x.device)) + 1e-8
+        return torch.clamp((x - mean_t) / std_t, -clip, clip)
+
+
+class MAPPOAgent(nn.Module):
+    """Actor uses local obs; critic uses global state (all agents' obs).
+
+    IMPORTANT: hidden dim is 128, matching train_gpsd_mappo.py.
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int, num_agents: int,
+                 global_dim: int = None):
+        super().__init__()
+        self.num_agents = num_agents
+        if global_dim is None:
+            global_dim = obs_dim * num_agents
+
+        # --- Decentralised Actor (local observations only) ---
+        self.actor_net = nn.Sequential(
+            layer_init(nn.Linear(obs_dim, 512)),
+            nn.Tanh(),
+            layer_init(nn.Linear(512, 512)),
+            nn.Tanh(),
+        )
+        self.actor_head = layer_init(nn.Linear(512, act_dim), std=0.01)
+
+        # --- Centralised Critic (global state) ---
+        self.critic_net = nn.Sequential(
+            layer_init(nn.Linear(global_dim, 512)),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+        )
+        self.critic_head = layer_init(nn.Linear(512, 1), std=0.01)
+
+    def get_value(self, global_state):
+        return self.critic_head(self.critic_net(global_state))
+
+    def get_action(self, local_obs, action=None):
+        hidden = self.actor_net(local_obs)
+        logits = self.actor_head(hidden)
+        probs = Categorical(logits=logits)
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action), probs.entropy()
+
+    def get_action_and_value(self, local_obs, global_state, action=None):
+        act, logprob, entropy = self.get_action(local_obs, action)
+        value = self.get_value(global_state)
+        return act, logprob, entropy, value
+
+
+# ---------------------------------------------------------------------------
 # Policy selection
 # ---------------------------------------------------------------------------
 def list_available_policies():
     """Find all saved policy models in the runs directory."""
-    model_paths = glob.glob("runs/*/gpsd_ppo_agent.pt")
+    # Include any saved .pt files inside run folders (ppo, mappo, etc.)
+    model_paths = glob.glob("runs/*/*.pt")
     policies = []
     for path in sorted(model_paths):
         run_name = path.split('/')[1]
@@ -134,7 +208,7 @@ def load_checkpoint_args(model_path):
 
 
 def load_policy(model_path, obs_dim, act_dim, device, num_agents=5, n_cells=4):
-    """Load a trained policy from disk (auto-detects MLP vs CNN architecture)."""
+    """Load a trained policy from disk (auto-detects MLP vs CNN vs MAPPO architecture)."""
     checkpoint = torch.load(model_path, map_location=device)
 
     # Detect architecture from checkpoint metadata
@@ -146,7 +220,86 @@ def load_policy(model_path, obs_dim, act_dim, device, num_agents=5, n_cells=4):
         ckpt_n_cells = checkpoint.get('n_cells', n_cells)
         ckpt_args = checkpoint.get('args', {})
         ckpt_num_agents = ckpt_args.get('num_agents', num_agents)
+        if 'cell_width' in ckpt_args:
+            ckpt_n_cells = int(np.round(1.0 / ckpt_args['cell_width']))
 
+    # Determine which state_dict to inspect/load
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint if isinstance(checkpoint, dict) else None
+
+    # If checkpoint appears to be a MAPPO-trained model (keys like 'actor_net'),
+    # instantiate the MAPPOAgent and wrap it so it exposes get_action_and_value(x).
+    is_mappo = False
+    if isinstance(state_dict, dict):
+        for k in state_dict.keys():
+            if k.startswith('actor_net') or k.startswith('actor_head') or k.startswith('critic_head'):
+                is_mappo = True
+                break
+
+    if is_mappo:
+        # Determine hidden dim from state dict (default to 128 if not found)
+        hidden_dim = 128
+        if isinstance(state_dict, dict) and 'actor_net.0.weight' in state_dict:
+            hidden_dim = state_dict['actor_net.0.weight'].shape[0]
+            
+        # Build MAPPO agent with matching dims
+        # The critic global_dim is obs_dim * num_agents + world_obs_dim
+        # world_obs_dim = N_a * 6 + N_pois * 3 (where N_pois = n_cells^2)
+        n_pois = ckpt_n_cells * ckpt_n_cells
+        world_obs_dim = ckpt_num_agents * 6 + n_pois * 3
+        global_dim = obs_dim * ckpt_num_agents + world_obs_dim
+
+        mappo_agent = MAPPOAgent(
+            obs_dim, act_dim, ckpt_num_agents, 
+            global_dim=global_dim, hidden_dim=hidden_dim
+        ).to(device)
+        print(f"  Architecture: MAPPO (detected from checkpoint, hidden={hidden_dim})")
+        mappo_agent.load_state_dict(state_dict)
+
+        # --- Load obs normaliser if saved alongside the checkpoint ---
+        obs_rms = None
+        if isinstance(checkpoint, dict) and 'obs_rms' in checkpoint:
+            obs_rms = checkpoint['obs_rms']
+            print(f"  Loaded obs normaliser (obs_rms) from checkpoint")
+        else:
+            # Try loading from a sibling pickle file
+            rms_path = os.path.join(os.path.dirname(model_path), "obs_rms.pkl")
+            if os.path.exists(rms_path):
+                with open(rms_path, "rb") as f:
+                    obs_rms = pickle.load(f)
+                print(f"  Loaded obs normaliser from {rms_path}")
+            else:
+                print("  WARNING: No obs normaliser found — feeding raw observations!")
+
+        # Wrapper that normalises observations and properly reconstructs
+        # the global state from all agents' local observations.
+        class MAPPOWrapper(nn.Module):
+            def __init__(self, agent, num_agents, global_dim, obs_rms=None):
+                super().__init__()
+                self.agent = agent
+                self.num_agents = num_agents
+                self.global_dim = global_dim
+                self.obs_rms = obs_rms
+
+            def eval(self):
+                self.agent.eval()
+
+            def get_action_and_value(self, local_obs, action=None):
+                # Normalise observations the same way training does
+                if self.obs_rms is not None:
+                    local_obs = self.obs_rms.normalize(local_obs)
+
+                # Decentralised execution: only the actor is needed
+                act, logprob, entropy = self.agent.get_action(local_obs, action)
+                return act, logprob, entropy, torch.zeros((local_obs.shape[0], 1), device=local_obs.device)
+
+        wrapped = MAPPOWrapper(mappo_agent, ckpt_num_agents, global_dim, obs_rms=obs_rms)
+        wrapped.eval()
+        return wrapped
+
+    # Fallback: standard (PPO-style) architectures
     if arch == 'cnn':
         agent = CNNAgent(ckpt_num_agents, ckpt_n_cells, act_dim).to(device)
         print(f"  Architecture: CNN (n_cells={ckpt_n_cells})")
@@ -180,6 +333,10 @@ def parse_args():
                         help="Number of agents override (auto-detected from checkpoint if not set)")
     parser.add_argument("--no-render", action="store_true",
                         help="Disable rendering (faster)")
+    parser.add_argument("--plot-rewards", action="store_true",
+                        help="Save a plot of rewards per agent over time")
+    parser.add_argument("--plot-ratios", action="store_true",
+                        help="Save a plot of global/local reward magnitude ratios")
     return parser.parse_args()
 
 
@@ -218,7 +375,15 @@ if __name__ == "__main__":
     if use_trained_policy:
         policy_path = args.policy
         if os.path.isdir(policy_path):
-            policy_path = os.path.join(policy_path, "gpsd_ppo_agent.pt")
+            # If a directory is provided, pick the first .pt file inside (supports ppo/mappo)
+            pt = None
+            for candidate in glob.glob(os.path.join(policy_path, "*.pt")):
+                pt = candidate
+                break
+            if pt is None:
+                print(f"\n✗ Error: No .pt file found in directory: {policy_path}")
+                sys.exit(1)
+            policy_path = pt
             print(f"Directory provided, using: {policy_path}")
         if not os.path.exists(policy_path):
             print(f"\n✗ Error: Policy file not found: {policy_path}")
@@ -231,9 +396,9 @@ if __name__ == "__main__":
     # Resolve env parameters: CLI override > checkpoint > defaults
     N_a = args.num_agents or ckpt_args.get('num_agents', 5)
     cell_width = args.cell_width or ckpt_args.get('cell_width', 0.25)
-    speed = ckpt_args.get('speed', 0.2)
+    speed = ckpt_args.get('speed', 0.1)
     r_c = ckpt_args.get('r_c', 0.3)
-    cov_c = ckpt_args.get('cov_c', 0.25)
+    cov_c = ckpt_args.get('cov_c', 0.1)
     max_cycles = args.max_cycles
 
     # Show computed grid info
@@ -306,6 +471,10 @@ if __name__ == "__main__":
             episode_rewards = []
             coverage_progress = []
             
+            # Track rewards for each agent over time
+            agent_history = {agent: [] for agent in e.possible_agents}
+            ratio_history = {agent: [] for agent in e.possible_agents}
+            
             # Run episode
             for cycle in range(args.max_cycles):
                 cycle_rewards = []
@@ -313,6 +482,17 @@ if __name__ == "__main__":
                 for _ in range(len(e.possible_agents)):
                     agent_name = e.agent_selection
                     obs, rew, term, trunc, info = e.last()
+                    
+                    # Record reward for this agent
+                    agent_history[agent_name].append(rew)
+                    
+                    # Record local and global reward for ratio plotting
+                    if args.plot_ratios:
+                        local_r = info.get("local_reward", 0.0)
+                        global_r = info.get("global_reward", 0.0)
+                        # Avoid division by zero, use epsilon
+                        ratio = abs(global_r) / (abs(local_r) + 1e-6)
+                        ratio_history[agent_name].append(ratio)
                     
                     cycle_rewards.append(rew)
                     total_reward += rew
@@ -366,6 +546,54 @@ if __name__ == "__main__":
 
         except KeyboardInterrupt:
             print("\n\nInterrupted by user")
+
+        # Plot rewards if requested
+        if args.plot_rewards:
+            try:
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(12, 6))
+                for agent_name, rewards in agent_history.items():
+                    plt.plot(rewards, label=agent_name, alpha=0.8)
+                
+                plt.title(f"Rewards per Agent - Episode {episode + 1}")
+                plt.xlabel("Cycle")
+                plt.ylabel("Reward")
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                
+                # Create a plots directory if it doesn't exist
+                os.makedirs("plots", exist_ok=True)
+                plot_filename = f"plots/episode_{episode + 1}_rewards.png"
+                plt.savefig(plot_filename)
+                plt.close()
+                print(f"✓ Reward plot saved to: {plot_filename}")
+            except ImportError:
+                print("! Warning: matplotlib not found, skipping plot generation.")
+            except Exception as e:
+                print(f"! Warning: Failed to generate plot: {e}")
+
+        # Plot reward ratios if requested
+        if args.plot_ratios:
+            try:
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(12, 6))
+                for agent_name, ratios in ratio_history.items():
+                    plt.plot(ratios, label=agent_name, alpha=0.8)
+                
+                plt.title(f"Global/Local Reward Magnitude Ratio - Episode {episode + 1}")
+                plt.xlabel("Cycle")
+                plt.ylabel("|Global| / (|Local| + eps)")
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.yscale('log') # Use log scale as ratios can vary wildly
+                
+                os.makedirs("plots", exist_ok=True)
+                plot_filename = f"plots/episode_{episode + 1}_ratios.png"
+                plt.savefig(plot_filename)
+                plt.close()
+                print(f"✓ Reward ratio plot saved to: {plot_filename}")
+            except Exception as e:
+                print(f"! Warning: Failed to generate ratio plot: {e}")
 
         # Episode summary
         print(f"\n{'='*70}")

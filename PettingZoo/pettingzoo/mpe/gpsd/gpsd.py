@@ -86,15 +86,15 @@ class raw_env(SimpleEnv, EzPickle):
         self,
         N_a=5,
         cell_width=0.25,
-        local_ratio=0.1,
+        local_ratio=0.999,
         max_cycles=100,
         continuous_actions=False,
         render_mode=None,
         dynamic_rescaling=False,
-        min_w=-1.0,
-        max_w=1.0,
+        min_w=-0.5,
+        max_w=0.5,
         speed=0.2,
-        r_c=0.5,
+        r_c=0.1,
         cov_c=0.25,
         p_noise=0.1,
         r_cov=0.01,
@@ -138,14 +138,51 @@ class raw_env(SimpleEnv, EzPickle):
         self.metadata["name"] = "gpsd_v1"
 
     def _execute_world_step(self):
-        """Override to inject coverage metrics into agent info dicts."""
+        """Override to inject coverage metrics and world observation into agent info dicts."""
         super()._execute_world_step()
         if hasattr(self.scenario, 'covered') and self.scenario.covered:
             coverage_ratio = sum(self.scenario.covered) / len(self.scenario.covered)
         else:
             coverage_ratio = 0.0
+        
+        # Calculate Algebraic Connectivity (lambda_2 of Laplacian)
+        n_agents = len(self.world.agents)
+        adj = np.zeros((n_agents, n_agents))
+        for i, agent_i in enumerate(self.world.agents):
+            for j, agent_j in enumerate(self.world.agents):
+                if i == j: continue
+                dist = np.linalg.norm(agent_i.state.p_pos - agent_j.state.p_pos)
+                if dist <= self.world.r_c:
+                    adj[i, j] = 1.0
+        
+        degree = np.diag(np.sum(adj, axis=1))
+        laplacian = degree - adj
+        eigenvalues = np.sort(np.linalg.eigvalsh(laplacian))
+        # lambda_2 is the second smallest eigenvalue
+        algebraic_connectivity = eigenvalues[1] if len(eigenvalues) > 1 else 0.0
+
+        world_obs = self.scenario.world_observation(self.world).astype(np.float32)
         for agent_name in self.agents:
             self.infos[agent_name]["coverage_ratio"] = coverage_ratio
+            self.infos[agent_name]["world_obs"] = world_obs
+            self.infos[agent_name]["algebraic_connectivity"] = algebraic_connectivity
+            # Per-agent flag: is this agent currently inside the GPSD zone?
+            agent_obj = self.world.agents[self._index_map[agent_name]]
+            self.infos[agent_name]["in_gpsd_zone"] = float(
+                self.world.is_in_gpsd_zone(agent_obj.state.p_pos)
+            )
+
+        # Terminate episode early when all POIs are covered
+        if coverage_ratio >= 1.0:
+            for agent_name in self.agents:
+                self.terminations[agent_name] = True
+
+    def reset(self, seed=None, options=None):
+        """Override reset to include world observation in initial infos."""
+        super().reset(seed=seed, options=options)
+        world_obs = self.scenario.world_observation(self.world).astype(np.float32)
+        for agent_name in self.agents:
+            self.infos[agent_name]["world_obs"] = world_obs
 
     def _set_action(self, action, agent, action_space, time=None):
         """Override: map discrete action index to a scalar turn rate (omega).
@@ -178,12 +215,11 @@ class raw_env(SimpleEnv, EzPickle):
         # Update agent colors based on covariance before rendering
         self.scenario._update_agent_colors(self.world)
         
-        # Call parent draw to render entities
-        super().draw()
+        # Clear screen
+        self.screen.fill((255, 255, 255))
         
-        # Get current camera range for coordinate transformation
-        all_poses = [entity.state.p_pos for entity in self.world.entities]
-        cam_range = np.max(np.abs(np.array(all_poses)))
+        # Fixed camera range to prevent dynamic zooming
+        cam_range = 1.1  # Fixed range to show full world consistently
         
         def world_to_screen(pos):
             """Convert world coordinates to screen coordinates."""
@@ -192,6 +228,13 @@ class raw_env(SimpleEnv, EzPickle):
             x = ((x / cam_range) * self.width // 2 * 0.9) + self.width // 2
             y = ((y / cam_range) * self.height // 2 * 0.9) + self.height // 2
             return (int(x), int(y))
+        
+        # Draw all entities (agents and landmarks) with fixed scaling
+        for entity in self.world.entities:
+            x, y = world_to_screen(entity.state.p_pos)
+            radius = int(entity.size * 350)  # Fixed size scaling
+            pygame.draw.circle(self.screen, entity.color * 200, (x, y), radius)
+            pygame.draw.circle(self.screen, (0, 0, 0), (x, y), radius, 1)  # borders
         
         # Draw communication links between agents within r_c range
         r_c = self.world.r_c if hasattr(self.world, 'r_c') else 0.3
@@ -273,10 +316,12 @@ parallel_env = parallel_wrapper_fn(env)
 
 
 class Scenario(BaseScenario):
+
     def __init__(self, r_c=0.3, cov_c=0.5):
         self.r_c = r_c        # coverage distance threshold
         self.cov_c = cov_c    # coverage covariance trace threshold
         self.covered = []     # tracks which POIs have been covered
+        self.last_covered=[]  # no of steps since each POI was last covered (for potential future use in reward shaping)
 
     def make_world(self, N_a=5, cell_width=0.25, speed=1.0, p_noise=0.1, r_c=0.3, r_cov=0.01):
         world = World()
@@ -339,9 +384,15 @@ class Scenario(BaseScenario):
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
+    # Toggle this to switch spawn strategy:
+    #   False = random cluster within r_c of swarm center
+    #   True  = straight line perpendicular to approach direction
+    USE_LINE_SPAWN = False
+
     def reset_world(self, world, np_random):
         self.covered = [False] * len(world.landmarks)
 
+        self.last_covered = [0] * len(world.landmarks)  # reset last covered counters
         # Agent appearance
         for agent in world.agents:
             agent.color = np.array([0.35, 0.35, 0.85])  # blue
@@ -351,45 +402,78 @@ class Scenario(BaseScenario):
             lm.color = np.array([0.25, 0.75, 0.25])
             lm.covered = False  # Initialize covered state
 
-        # Place agents as a swarm outside the GPS denied zone
-        # GPSD zone center is at (0, 0)
-        gpsd_center = np.array([0.0, 0.0])
-        
-        # Pick a random swarm center location outside GPS denied zone
-        swarm_center = None
-        radius=0.75
-        while swarm_center is None:
-            angle=np.random.uniform(0, 2*np.pi)
-            angle=0
-            pos = [radius*np.sin(angle-np.pi/2),radius*np.cos(angle-np.pi/2)]
-            if not world.is_in_gpsd_zone(pos):
-                swarm_center = np.array(pos)
-        
-        # Place all agents within 0.3 of the swarm center
-        spacing=0.1
-        for i,agent in enumerate(world.agents):
-            limits=len(world.agents)*spacing/2
-            centered_array = np.arange(-limits, limits + 1e-9, spacing)
-            # Generate random offset within 0.3 radius
-            radius=centered_array[i]
-            angle_perp=angle 
-            offset = np.array([radius*np.sin(angle_perp), radius*np.cos(angle_perp)])
-            
-            agent.state.p_pos = swarm_center + offset
-            # Belief starts at true position (GPS available outside zone)
-            agent.state.p_belief = agent.state.p_pos.copy()
-            # Constant speed stored as scalar so the unicycle formula works
-            agent.state.p_vel = np.array([agent.speed, agent.speed])
-            
-            
-            agent.state.heading = angle
-            
-            agent.state.p_covariance = np.zeros((world.dim_p, world.dim_p))
+        # --- Choose spawn strategy ---
+        if self.USE_LINE_SPAWN:
+            self._spawn_line(world, np_random)
+        else:
+            self._spawn_cluster(world, np_random)
 
         # Place POIs at the center of each grid cell (fixed positions)
         for lm in world.landmarks:
             lm.state.p_pos = lm.poi_center.copy()
             lm.state.p_vel = np.zeros(world.dim_p)
+
+    # ------------------------------------------------------------------
+    # Spawn strategies
+    # ------------------------------------------------------------------
+    def _pick_swarm_center(self, world, np_random, radius=0.75):
+        """Pick a random point at `radius` from origin, outside the GPSD zone.
+
+        Returns (swarm_center, angle) where angle is the approach heading
+        towards (0, 0).
+        """
+        while True:
+            angle = np_random.uniform(0, 2 * np.pi)
+            pos = np.array([radius * np.cos(angle), radius * np.sin(angle)])
+            if not world.is_in_gpsd_zone(pos):
+                # heading points from pos towards the origin
+                approach_angle = np.arctan2(-pos[1], -pos[0])
+                return pos, approach_angle
+
+    def _init_agent_state(self, agent, pos, heading, world):
+        """Set common initial state for an agent."""
+        agent.state.p_pos = pos
+        agent.state.p_belief = pos.copy()
+        agent.state.p_vel = np.array([agent.speed, agent.speed])
+        agent.state.heading = heading
+        agent.state.p_covariance = np.zeros((world.dim_p, world.dim_p))
+
+    def _spawn_cluster(self, world, np_random):
+        """Spawn agents randomly within r_c of a swarm center.
+
+        Each agent gets a random position inside a circle of radius r_c
+        centred on the swarm centre, and faces towards the origin.
+        """
+        swarm_center, approach_angle = self._pick_swarm_center(world, np_random)
+
+        for agent in world.agents:
+            r = np_random.uniform(0, self.r_c)
+            theta = np_random.uniform(0, 2 * np.pi)
+            offset = np.array([r * np.cos(theta), r * np.sin(theta)])
+            pos = swarm_center + offset
+            noisy_angle = approach_angle + np_random.uniform(-np.pi/2, np.pi/2)
+            self._init_agent_state(agent, pos, noisy_angle, world)
+
+    def _spawn_line(self, world, np_random):
+        """Spawn agents in a straight line perpendicular to the approach direction.
+
+        Agents are evenly spaced along a line centred on the swarm centre,
+        oriented perpendicular to the direction towards (0, 0).
+        """
+        swarm_center, approach_angle = self._pick_swarm_center(world, np_random)
+
+        n = len(world.agents)
+        spacing = 0.1
+        # Perpendicular direction (rotate approach by 90 deg)
+        perp_angle = approach_angle + np.pi / 2
+        perp_dir = np.array([np.cos(perp_angle), np.sin(perp_angle)])
+
+        # Centred offsets: e.g. for 5 agents → [-0.2, -0.1, 0, 0.1, 0.2]
+        offsets = (np.arange(n) - (n - 1) / 2.0) * spacing
+
+        for i, agent in enumerate(world.agents):
+            pos = swarm_center + offsets[i] * perp_dir
+            self._init_agent_state(agent, pos, approach_angle, world)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -464,29 +548,38 @@ class Scenario(BaseScenario):
         """Local per-agent reward: penalise long paths & boundary violations."""
         rew = 0.0
 
-        # Path penalty (each timestep costs a small amount)
-        rew -= 0.05
 
         
         # Add reward proportional to number of agents in communication range
         cov_weight = 0.0
+        connections=0
         for other in world.agents:
             if other is agent:
                 continue
             dist = np.sqrt(np.sum(np.square(agent.state.p_pos - other.state.p_pos)))
-            #if dist <= self.r_c and self._get_cov_trace(other, world) < self.cov_c and (world.is_in_gpsd_zone(other.state.p_pos) or world.is_in_gpsd_zone(agent.state.p_pos)):
-            #    rew+=1.0/(1.0 + self._get_cov_trace(other, world))
+            if dist <= self.r_c and (world.is_in_gpsd_zone(other.state.p_pos) or world.is_in_gpsd_zone(agent.state.p_pos)):
+                rew+=0.125/(1.0 + 1.0*self._get_cov_trace(other, world))
+            #elif dist <= self.r_c:
+            #    rew+=0.1/(1.0 + 1.0*self._get_cov_trace(other, world))
 
-
-        # Penalty for being in GPS denied zone with high covariance
+            if dist<=self.r_c and world.is_in_gpsd_zone(other.state.p_pos):
+                connections+=1
+                
+        cov_trace = self._get_cov_trace(agent, world)
+        # Small reward for being in GPS denied zone with low covariance
         if world.is_in_gpsd_zone(agent.state.p_pos):
-            cov_trace = self._get_cov_trace(agent, world)
-            if cov_trace < self.cov_c:
-                rew += float(np.exp(self.cov_c-cov_trace))
+            
+            # Mild shaping: reward low covariance when connected, but capped
+            rew += 1.0 * connections / (1.0 + 10*cov_trace)
         else:
             gpsd_center = np.zeros(world.dim_p)
             dist_to_center = np.linalg.norm(agent.state.p_pos - gpsd_center)
-            rew -= -2.0 * np.exp(dist_to_center)
+            if connections == 0:
+                # Penalize being far from the GPSD zone centre (drives agents inward)
+                rew -= 10.0 *(dist_to_center-0.5)
+            #else:
+            #    rew += 1.0 * connections / (1.0 + cov_trace)
+
             # Penalize moving away from GPS denied zone center
             
 
@@ -503,9 +596,24 @@ class Scenario(BaseScenario):
         """Global cooperative reward: coverage progress for the whole team."""
         rew = 0.0
         
-        # Calculate current coverage percentage for reward scaling
+        # Path penalty (each timestep costs a small amount)
+        rew -= 0.05
         total_pois = len(world.landmarks)
         num_covered = sum(self.covered)
+        # Shaping: reward proximity to the nearest uncovered POI
+        for i, lm in enumerate(world.landmarks):
+            if self.covered[i]:
+                self.last_covered[i]+=1  # increment counter if currently covered
+                if self.last_covered[i] >= 1000:  # small bonus for recently covered POIs to encourage maintaining coverage
+                    self.covered[i] = False
+                    self.last_covered[i] = 0  # reset counter
+                continue
+            for agent in world.agents:
+                dist = np.linalg.norm(agent.state.p_pos - lm.state.p_pos)
+                # Smooth attraction toward uncovered POIs
+                rew += (1/(1+(total_pois-num_covered)))*(num_covered+1/total_pois+1) * 1/dist
+        # Calculate current coverage percentage for reward scaling
+
 
         for i, lm in enumerate(world.landmarks):
             if self.covered[i]:
@@ -527,9 +635,9 @@ class Scenario(BaseScenario):
                 # Base reward inversely proportional to covariance
                 base_reward = 1.0 / (1.0 + best_cov_trace)
                 
-                # Scale factor: increases as more POIs are covered (1.0 to 3.0)
+                # Scale factor: increases as more POIs are covered (1.0 to 10.0)
                 coverage_ratio = num_covered / total_pois
-                scale_factor = 1.0 + 2.0 * coverage_ratio
+                scale_factor = 1.0 + 9.0 * coverage_ratio
                 
                 self.covered[i] = True
                 lm.covered = True
@@ -538,16 +646,15 @@ class Scenario(BaseScenario):
                 
                 # Update num_covered for subsequent POIs covered in same step
                 num_covered += 1
-            
-            elif best_dist < self.r_c and best_cov_trace >= self.cov_c:
-                # Agent is close to POI but covariance is too high to cover it
-                # Penalty inversely proportional to remaining covariance budget
-                agent.color= np.array([0.75, 0.75, 0.25])  # yellow = close but not covered
-                rew -= 0.05 #float(np.exp(best_cov_trace - self.cov_c))
+
+            elif best_dist < self.r_c and best_cov_trace < float("inf"):
+                # Agent near POI but covariance too high: partial shaping reward
+                # Encourages agents to reduce covariance (approach teammates)
+                rew += 0.05 * (1.0 - min(best_cov_trace / self.cov_c, 1.0))
 
         # Big bonus reward if all POIs are covered
         if all(self.covered):
-            rew += 5.0
+            rew += 100.0
 
         return rew
 
@@ -594,29 +701,80 @@ class Scenario(BaseScenario):
         poi_rel_pos = []
         for lm in world.landmarks:
             rel_world = lm.state.p_pos - belief_pos
-            rel_body = self._world_to_body_frame(rel_world, heading_val)
+            rel_body = rel_world
+            #rel_body = self._world_to_body_frame(rel_world, heading_val)
             poi_rel_pos.append(rel_body)
-
+ # Signal: out of range
         # Other agents: relative position (belief-to-belief, in body frame) + communication (range, cov_trace)
         other_pos = []
         other_comm = []
+        other_heading =[]
         for other in world.agents:
             if other is agent:
                 continue
             other_belief = other.state.p_belief if other.state.p_belief is not None else other.state.p_pos
             rel_world = other_belief - belief_pos
-            rel_body = self._world_to_body_frame(rel_world, heading_val)
-            other_pos.append(rel_body)
+            rel_body=rel_world
+            #rel_body = self._world_to_body_frame(rel_world, heading_val)
+            
+            
+            rel_heading = np.abs(np.arctan2(rel_body[1], rel_body[0]) - heading if rel_body[0] != 0 else 0.0)
             # Noisy range measurement (only if within communication radius)
             true_dist = np.sqrt(np.sum(np.square(agent.state.p_pos - other.state.p_pos)))
-            if true_dist <= world.r_c:
+            other_cov = self._get_cov_trace(other, world)
+            if true_dist <= 100*world.r_c:
                 range_meas = true_dist + np.random.randn() * np.sqrt(world.r_cov)
+                other_pos.append(rel_body)
+                other_heading.append(rel_heading)
+                
             else:
                 range_meas = -1.0  # Signal: out of range
-            other_cov = self._get_cov_trace(other, world)
-            other_comm.append(np.array([range_meas, other_cov]))
+                other_cov = -1.0  # Signal: out of range
+                other_pos.append(np.array([-1.0, -1.0]))  # Signal: out of range
+                other_heading.append(np.array([-1.0]))  # Signal: out of range #not yet implemented
+            other_comm.append(np.array([other_cov]))
 
         return np.concatenate(
             [heading] + [belief_pos] + [cov_trace] + [in_gpsd_zone]
-            + poi_obs + other_pos + other_comm
+            + poi_rel_pos + other_pos + other_comm + other_heading
         )
+    
+    def world_observation(self, world):
+        """Global observation vector for the centralised critic.
+
+        All positions are in world frame w.r.t. the world centre (origin).
+
+        Layout:
+            For each agent (N_a times):
+                heading         (1)
+                true_pos        (2)   -- ground-truth position
+                belief_pos      (2)   -- agent's believed position
+                cov_trace       (1)   -- trace of position covariance
+            For each POI (N_r times):
+                poi_pos         (2)   -- absolute position w.r.t. world centre
+                covered         (1)   -- 1.0 if covered, 0.0 otherwise
+
+        Total dim = N_a * 6 + N_r * 3
+        """
+        agent_obs = []
+        for agent in world.agents:
+            heading_val = agent.state.heading if agent.state.heading is not None else 0.0
+            true_pos = agent.state.p_pos
+            belief_pos = agent.state.p_belief if agent.state.p_belief is not None else agent.state.p_pos
+            cov_trace = self._get_cov_trace(agent, world)
+            agent_obs.append(np.array([
+                heading_val,
+                true_pos[0], true_pos[1],
+                belief_pos[0], belief_pos[1],
+                cov_trace,
+            ]))
+
+        poi_obs = []
+        for i, lm in enumerate(world.landmarks):
+            covered_flag = float(self.covered[i]) if i < len(self.covered) else 0.0
+            poi_obs.append(np.array([
+                lm.state.p_pos[0], lm.state.p_pos[1],
+                covered_flag,
+            ]))
+
+        return np.concatenate(agent_obs + poi_obs)

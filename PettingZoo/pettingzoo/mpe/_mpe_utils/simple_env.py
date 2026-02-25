@@ -140,6 +140,13 @@ class SimpleEnv(AECEnv):
         return self.scenario.observation(
             self.world.agents[self._index_map[agent]], self.world
         ).astype(np.float32)
+    
+    def global_observe(self):
+        return self.scenario.world_observation(
+            self.world
+        ).astype(np.float32)
+
+
 
     def state(self):
         states = tuple(
